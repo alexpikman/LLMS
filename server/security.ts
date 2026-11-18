@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import https from 'node:https';
+import { Readable } from 'node:stream';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import {
@@ -112,44 +114,74 @@ export async function safeFetch(
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const safeUrl = await assertSafeRemoteUrl(currentUrl);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    let externalSignal = init.signal;
-    const onAbort = () => controller.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) controller.abort();
-      else externalSignal.addEventListener('abort', onAbort, { once: true });
+    const host = safeUrl.hostname.replace(/^\\[|\\]$/g, '');
+    const resolved = await dns.lookup(host, { all: true, verbatim: true });
+    if (!resolved.length || resolved.some((record) => isPrivateOrReservedIp(record.address))) {
+      throw new Error(`DNS-адрес хоста ${host} не прошёл SSRF-проверку.`);
     }
 
-    try {
-      const res = await fetch(safeUrl.toString(), {
-        ...init,
-        redirect: 'manual',
-        signal: controller.signal,
+    // Pin the socket to the exact public IP that was validated above. The TLS
+    // server name remains the original hostname, preventing DNS rebinding
+    // between validation and the actual TCP connection.
+    const pinned = resolved[0];
+    const headers = new Headers(init.headers);
+    const requestHeaders: Record<string, string> = {};
+    headers.forEach((value, key) => { requestHeaders[key] = value; });
+
+    const response = await new Promise<globalThis.Response>((resolve, reject) => {
+      const request = https.request({
+        protocol: 'https:',
+        hostname: host,
+        port: safeUrl.port ? Number(safeUrl.port) : 443,
+        path: `${safeUrl.pathname}${safeUrl.search}`,
+        method: init.method ?? 'GET',
+        headers: requestHeaders,
+        servername: net.isIP(host) ? undefined : host,
+        signal: init.signal ?? undefined,
+        lookup: ((_hostname: string, _options: unknown, callback: (error: NodeJS.ErrnoException | null, address: string, family: number) => void) => {
+          callback(null, pinned.address, pinned.family);
+        }) as never,
+      }, (incoming) => {
+        const responseHeaders = new Headers();
+        for (const [key, value] of Object.entries(incoming.headers)) {
+          if (Array.isArray(value)) value.forEach((item) => responseHeaders.append(key, item));
+          else if (typeof value === 'string') responseHeaders.set(key, value);
+        }
+        const status = incoming.statusCode ?? 502;
+        const body = init.method?.toUpperCase() === 'HEAD' || status === 204 || status === 304
+          ? null
+          : Readable.toWeb(incoming) as ReadableStream<Uint8Array>;
+        resolve(new Response(body, {
+          status,
+          statusText: incoming.statusMessage,
+          headers: responseHeaders,
+        }));
       });
 
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get('location');
-        try {
-          await res.body?.cancel();
-        } catch {
-          // Ignore body cancel errors
-        }
-        if (!location) {
-          throw new Error(`Сервер вернул редирект ${res.status} без заголовка Location.`);
-        }
-        currentUrl = new URL(location, safeUrl).toString();
-        continue;
-      }
+      request.setTimeout(timeoutMs, () => request.destroy(new Error('Истекло время ожидания удалённого сервера.')));
+      request.once('error', reject);
 
-      return res;
-    } finally {
-      clearTimeout(timer);
-      if (externalSignal) {
-        externalSignal.removeEventListener('abort', onAbort);
+      const body = init.body;
+      if (typeof body === 'string' || body instanceof Uint8Array) {
+        request.write(body);
+      } else if (body !== null && body !== undefined) {
+        request.destroy(new Error('safeFetch поддерживает только строковое или бинарное тело запроса.'));
+        return;
       }
+      request.end();
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location) {
+        throw new Error(`Сервер вернул редирект ${response.status} без заголовка Location.`);
+      }
+      currentUrl = new URL(location, safeUrl).toString();
+      continue;
     }
+
+    return response;
   }
 
   throw new Error('Превышено максимальное число перенаправлений URL (SSRF-защита).');
