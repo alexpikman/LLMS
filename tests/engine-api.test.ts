@@ -30,7 +30,7 @@ async function bootTestServer() {
   const baseUrl = `http://127.0.0.1:${port}`;
 
   cleanupFns.push(async () => {
-    engine.shutdown();
+    await engine.shutdown();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.VLLM_DATA_DIR;
     fs.rmSync(tmpDir, { recursive: true, force: true });
