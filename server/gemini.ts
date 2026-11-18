@@ -157,7 +157,7 @@ export async function* streamGeminiText(
   });
 
   const iterator = responseStream[Symbol.asyncIterator]();
-  const cancelStream = () => { void iterator.return?.(); };
+  const cancelStream = () => { void iterator.return?.(undefined); };
   req.signal?.addEventListener('abort', cancelStream, { once: true });
   try {
     while (!req.signal?.aborted) {
