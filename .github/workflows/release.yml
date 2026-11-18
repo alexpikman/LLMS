@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   build-binaries:
@@ -39,13 +39,41 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: 'npm'
 
-      - name: Install dependencies
-        run: npm ci
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
 
       - name: Build standalone binary and frontend dist
-        run: npm run build:release
+        run: bun run build:release
+
+      - name: Smoke-test Windows executable
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: |
+          $process = Start-Process -FilePath ".\release-build\vllm-gateway.exe" -WorkingDirectory "$PWD\release-build" -PassThru
+          try {
+            $ready = $false
+            for ($attempt = 0; $attempt -lt 30; $attempt++) {
+              Start-Sleep -Seconds 1
+              try {
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing -TimeoutSec 2
+                if ($response.StatusCode -eq 200) {
+                  $ready = $true
+                  break
+                }
+              } catch {}
+            }
+            if (-not $ready) {
+              throw "Standalone executable did not serve the UI on http://127.0.0.1:3000"
+            }
+          } finally {
+            if (-not $process.HasExited) {
+              Stop-Process -Id $process.Id -Force
+            }
+          }
 
       - name: Package release archive (Unix)
         if: matrix.archive == 'tar.gz'
@@ -62,22 +90,55 @@ jobs:
           Copy-Item .env.example release-build/.env.example
           Compress-Archive -Path release-build/* -DestinationPath "vllm-gateway-${{ matrix.target }}.zip"
 
+      - name: Install Inno Setup
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: choco install innosetup --no-progress -y
+
+      - name: Build Windows installer
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF.StartsWith("refs/tags/v")) {
+            $version = $env:GITHUB_REF_NAME.TrimStart("v")
+          } else {
+            $version = "0.0.0"
+          }
+          $iscc = Join-Path "${env:ProgramFiles(x86)}" "Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler not found: $iscc"
+          }
+          & $iscc "/DAppVersion=$version" "installer/windows.iss"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
+          }
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: vllm-gateway-${{ matrix.target }}
-          path: vllm-gateway-${{ matrix.target }}.*
+          path: |
+            vllm-gateway-${{ matrix.target }}.*
+            vllm-gateway-setup-win-x64.exe
+          if-no-files-found: error
 
   publish-release:
     needs: build-binaries
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Download all binary artifacts
         uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS.txt
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
