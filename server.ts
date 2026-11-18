@@ -120,7 +120,10 @@ export async function createGatewayApp(options: {
       res.status(401).json({ error: 'Неверный API-токен.' });
       return;
     }
-    authManager.setSessionCookieHeader(res);
+    authManager.setSessionCookieHeader(
+      res,
+      req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+    );
     res.json({ authenticated: true });
   });
 
