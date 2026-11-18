@@ -247,6 +247,11 @@ export async function createGatewayApp(options: {
     }
 
     const stream = Boolean(body.stream);
+    const streamAbortController = stream ? new AbortController() : null;
+    const abortOnDisconnect = () => {
+      if (streamAbortController && !res.writableEnded) streamAbortController.abort();
+    };
+    if (stream) res.once('close', abortOnDisconnect);
     const lastUserMessage =
       [...messages].reverse().find((m) => m.role === 'user')?.content ??
       messages[messages.length - 1]?.content ??
@@ -376,15 +381,18 @@ export async function createGatewayApp(options: {
                 defaultSystemInstruction: deployment.systemInstruction,
                 temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
                 maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+                signal: streamAbortController?.signal,
               })
             : streamGeminiText({
                 baseModel: textModel,
                 messages,
                 defaultSystemInstruction: deployment.systemInstruction,
                 thinkingLevel: deployment.thinkingLevel,
+                signal: streamAbortController?.signal,
               });
 
         for await (const chunk of tokenStream) {
+          if (streamAbortController?.signal.aborted) break;
           if (chunk.text) {
             if (ttftMs === null) {
               ttftMs = performance.now() - startedAt;
@@ -406,6 +414,11 @@ export async function createGatewayApp(options: {
             completionTokens = chunk.usage.completionTokens || completionTokens;
             totalTokens = chunk.usage.totalTokens || totalTokens;
           }
+        }
+
+        if (streamAbortController?.signal.aborted) {
+          modelServer.markRequestError(deployment.id, record, 'Клиент прервал потоковый запрос.', performance.now() - startedAt);
+          return;
         }
 
         const totalDurationMs = performance.now() - startedAt;
@@ -511,7 +524,7 @@ export async function createGatewayApp(options: {
         mapped.message,
         performance.now() - startedAt
       );
-      if (stream && res.headersSent) {
+      if (stream && res.headersSent && !res.destroyed) {
         res.write(
           `data: ${JSON.stringify({ error: { message: mapped.message, code: mapped.status } })}\n\n`
         );
@@ -523,6 +536,7 @@ export async function createGatewayApp(options: {
         });
       }
     } finally {
+      if (stream) res.off('close', abortOnDisconnect);
       modelServer.releaseSlot(deployment.id);
     }
   });
@@ -558,6 +572,11 @@ export async function createGatewayApp(options: {
     }
 
     const stream = Boolean(body.stream);
+    const streamAbortController = stream ? new AbortController() : null;
+    const abortOnDisconnect = () => {
+      if (streamAbortController && !res.writableEnded) streamAbortController.abort();
+    };
+    if (stream) res.once('close', abortOnDisconnect);
     const record = modelServer.createRequestRecord({
       deployment,
       endpoint: '/v1/completions',
@@ -650,6 +669,7 @@ export async function createGatewayApp(options: {
               });
 
         for await (const chunk of compStream) {
+          if (streamAbortController?.signal.aborted) break;
           if (chunk.text) {
             if (ttftMs === null) ttftMs = performance.now() - startedAt;
             fullText += chunk.text;
@@ -669,6 +689,11 @@ export async function createGatewayApp(options: {
             completionTokens = chunk.usage.completionTokens || completionTokens;
             totalTokens = chunk.usage.totalTokens || totalTokens;
           }
+        }
+
+        if (streamAbortController?.signal.aborted) {
+          modelServer.markRequestError(deployment.id, record, 'Клиент прервал потоковый запрос.', performance.now() - startedAt);
+          return;
         }
 
         const totalDurationMs = performance.now() - startedAt;
