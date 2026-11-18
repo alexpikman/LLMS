@@ -7,6 +7,8 @@ export const ServerSettingsView: React.FC = () => {
   const [isSaving, setIsSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const [isRotatingToken, setIsRotatingToken] = useState(false);
+  const [newToken, setNewToken] = useState<string | null>(null);
 
   useEffect(() => {
     let active = true;
@@ -27,6 +29,23 @@ export const ServerSettingsView: React.FC = () => {
       active = false;
     };
   }, []);
+
+  const handleRotateToken = async () => {
+    if (!window.confirm('Старый API-токен перестанет работать. Продолжить?')) return;
+    setIsRotatingToken(true);
+    setError(null);
+    setNewToken(null);
+    try {
+      const response = await fetch('/api/auth/rotate', { method: 'POST' });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Не удалось перевыпустить токен');
+      setNewToken(data.token);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Ошибка перевыпуска токена');
+    } finally {
+      setIsRotatingToken(false);
+    }
+  };
 
   const handleSave = async (event: React.FormEvent) => {
     event.preventDefault();
@@ -115,6 +134,30 @@ export const ServerSettingsView: React.FC = () => {
             {isSaving ? 'Применение…' : 'Сохранить и перезапустить'}
           </button>
         </form>
+
+        <div className="rounded-xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-700 dark:bg-slate-900">
+          <h2 className="text-sm font-semibold">API-токен</h2>
+          <p className="mt-2 text-sm text-slate-500 dark:text-slate-400">
+            Перевыпуск немедленно отзывает предыдущий токен. Если задан VLLM_API_KEY, управляйте им через переменные окружения.
+          </p>
+          {newToken && (
+            <div className="mt-4 space-y-2">
+              <p className="text-xs font-medium text-emerald-700 dark:text-emerald-400">Новый токен. Сохраните его — повторно он не отображается.</p>
+              <code className="block break-all rounded-lg bg-slate-100 p-3 text-xs text-slate-900 dark:bg-slate-950 dark:text-slate-100">{newToken}</code>
+              <button type="button" onClick={() => navigator.clipboard.writeText(newToken)} className="rounded-lg border border-slate-300 px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-600 dark:text-slate-200 dark:hover:bg-slate-800">
+                Копировать токен
+              </button>
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={handleRotateToken}
+            disabled={isRotatingToken}
+            className="mt-4 rounded-lg border border-rose-300 px-4 py-2.5 text-sm font-semibold text-rose-700 transition hover:bg-rose-50 disabled:opacity-50 dark:border-rose-900 dark:text-rose-300 dark:hover:bg-rose-950"
+          >
+            {isRotatingToken ? 'Перевыпуск…' : 'Перевыпустить токен'}
+          </button>
+        </div>
       </div>
     </section>
   );
