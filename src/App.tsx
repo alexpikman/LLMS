@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type FormEvent } from 'react';
 import { GgufHubView } from './components/GgufHubView';
 import { GpuContextController } from './components/GpuContextController';
 import { ModelChatView } from './components/ModelChatView';
@@ -82,7 +82,7 @@ export default function App() {
     };
   }, [authState]);
 
-  const submitAuth = async (event: React.FormEvent<HTMLFormElement>) => {
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setAuthBusy(true);
     setAuthError(null);
