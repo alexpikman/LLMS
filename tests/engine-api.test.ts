@@ -201,6 +201,22 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     assert.equal(diagText.includes(setupJson.token), false);
     assert.equal(diagText.includes('tokenHash'), false);
     assert.equal(diagText.includes('sessionSecret'), false);
+
+    const rotateRes = await fetch(`${baseUrl}/api/auth/rotate`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${setupJson.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(rotateRes.status, 200);
+    const rotated = (await rotateRes.json()) as { token: string };
+    assert.ok(rotated.token.startsWith('sk-vllm-'));
+    const oldTokenRes = await fetch(`${baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${setupJson.token}` },
+    });
+    assert.equal(oldTokenRes.status, 401);
   });
 
   it('enforces ModelServerRuntime scheduler queue, SHA-256 RAM cache, and PagedAttention slot lifecycle', async () => {
