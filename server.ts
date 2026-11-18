@@ -905,6 +905,7 @@ export async function createGatewayApp(options: {
 
     try {
       const { embeddings, totalTokens } = await generateGeminiEmbeddings(inputs);
+      const useBase64 = body.encoding_format === 'base64';
       const durationMs = performance.now() - startedAt;
       modelServer.markRequestCompleted(deployment.id, record, {
         cacheHit: false,
@@ -920,7 +921,9 @@ export async function createGatewayApp(options: {
         data: embeddings.map((vec, index) => ({
           object: 'embedding',
           index,
-          embedding: vec,
+          embedding: useBase64
+            ? Buffer.from(new Float32Array(vec).buffer).toString('base64')
+            : vec,
         })),
         model: deployment.alias,
         usage: {
