@@ -8,6 +8,7 @@ export type WorkspaceViewId =
   | 'paged_blocks'
   | 'openai_api'
   | 'benchmarks'
+  | 'access'
   | 'settings';
 
 interface TopBarProps {
@@ -20,9 +21,10 @@ const NAV_ITEMS: Array<{ id: WorkspaceViewId; label: string }> = [
   { id: 'models', label: 'Модели и запуск' },
   { id: 'gguf_hub', label: 'Центр GGUF' },
   { id: 'chat', label: 'Чат с моделью' },
-  { id: 'paged_blocks', label: 'Блоки PagedAttention' },
+  { id: 'paged_blocks', label: 'PagedAttention' },
   { id: 'openai_api', label: 'OpenAI API' },
   { id: 'benchmarks', label: 'Бенчмарк' },
+  { id: 'access', label: 'Доступ к ОС' },
   { id: 'settings', label: 'Настройки' },
 ];
 

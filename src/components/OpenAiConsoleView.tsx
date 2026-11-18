@@ -51,12 +51,12 @@ export const OpenAiConsoleView: React.FC<OpenAiConsoleViewProps> = ({
   }, [compatibleModels, selectedAlias]);
 
   const originUrl =
-    typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3000';
+    typeof window !== 'undefined' ? window.location.origin : 'http://localhost:3003';
 
   const curlSnippet = useMemo(() => {
     const modelName = selectedAlias || 'hydrogen-chat';
     if (endpoint === '/v1/embeddings') {
-      return `curl ${originUrl}/v1/embeddings \\\n  -H "Authorization: Bearer YOUR_VLLM_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(
+      return `curl ${originUrl}/v1/embeddings \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(
         { model: modelName, input: userPrompt.trim() },
         null,
         2
@@ -79,7 +79,7 @@ export const OpenAiConsoleView: React.FC<OpenAiConsoleViewProps> = ({
             stream,
             prompt: userPrompt.trim(),
           };
-    return `curl ${originUrl}${endpoint} \\\n  -H "Authorization: Bearer YOUR_VLLM_API_KEY" \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(payload, null, 2)}'`;
+    return `curl ${originUrl}${endpoint} \\\n  -H "Content-Type: application/json" \\\n  -d '${JSON.stringify(payload, null, 2)}'`;
   }, [endpoint, selectedAlias, stream, systemPrompt, userPrompt, originUrl]);
 
   const pythonSnippet = useMemo(() => {
@@ -87,7 +87,7 @@ export const OpenAiConsoleView: React.FC<OpenAiConsoleViewProps> = ({
     if (endpoint === '/v1/embeddings') {
       return `from openai import OpenAI
 
-client = OpenAI(base_url="${originUrl}/v1", api_key="YOUR_VLLM_API_KEY")
+client = OpenAI(base_url="${originUrl}/v1", api_key="not-required")
 res = client.embeddings.create(
     model="${modelName}",
     input=${JSON.stringify(userPrompt.trim())}
@@ -96,7 +96,7 @@ print(len(res.data[0].embedding))`;
     }
     return `from openai import OpenAI
 
-client = OpenAI(base_url="${originUrl}/v1", api_key="YOUR_VLLM_API_KEY")
+client = OpenAI(base_url="${originUrl}/v1", api_key="not-required")
 res = client.chat.completions.create(
     model="${modelName}",
     messages=[

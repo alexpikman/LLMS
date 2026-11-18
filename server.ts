@@ -4,14 +4,18 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runAgentChatStream } from './server/agentChat.ts';
+import { getDataDir, loadOrInitConfig } from './server/config.ts';
 import {
   downloadManager,
+  installLlamaServerFromArchive,
   installLlamaServerRuntime,
   listHubGgufFiles,
   probeDirectGgufUrl,
   searchHubModels,
+  type LlamaBackendPreference,
 } from './server/downloader.ts';
-import { modelServer } from './server/engine.ts';
+import { modelServer, type ModelServerRuntime } from './server/engine.ts';
 import {
   formatGeminiError,
   generateGeminiEmbeddings,
@@ -21,6 +25,17 @@ import {
 } from './server/gemini.ts';
 import { generateGgufChat, streamGgufChat } from './server/ggufRunner.ts';
 import { assessModelCompatibility, detectHardwareProfile } from './server/hardware.ts';
+import { logger, maskSecretValue } from './server/logger.ts';
+import { normalizeOpenAiMessages, openAiError } from './server/security.ts';
+import {
+  clearToolAuditLogs,
+  detectShellEnvironment,
+  getAccessConfig,
+  getToolAuditLogs,
+  resetAccessConfig,
+  testWorkspacePath,
+  updateAccessConfig,
+} from './server/workspaceTools.ts';
 import type { HubSource } from './src/types/engine.ts';
 
 const __filename = typeof import.meta?.url === 'string' ? fileURLToPath(import.meta.url) : '';
@@ -46,24 +61,87 @@ function resolvePublicDistDir(): string {
   return path.resolve(process.cwd(), 'dist');
 }
 
-async function startServer() {
+export interface GatewayAppOptions {
+  engine?: ModelServerRuntime;
+  enableVite?: boolean;
+  host?: string;
+  initialPort?: number;
+  getServer?: () => ReturnType<express.Express['listen']> | undefined;
+  setServer?: (next: ReturnType<express.Express['listen']>) => void;
+}
+
+export async function createGatewayApp(options: GatewayAppOptions = {}) {
+  const engine = options.engine ?? modelServer;
+  const HOST = options.host ?? process.env.HOST ?? '127.0.0.1';
+  let currentPort = options.initialPort ?? (Number(process.env.PORT) || DEFAULT_PORT);
+
   const app = express();
   app.use(express.json({ limit: '4mb' }));
 
-  const HOST = process.env.HOST || '127.0.0.1';
-  let currentPort = Number(process.env.PORT) || DEFAULT_PORT;
-  if (!process.env.PORT) {
+  // =========================================================================
+  // Health, Readiness & Diagnostics (Tokenless)
+  // =========================================================================
+  app.get('/health', (_req, res) => {
+    res.json({
+      status: 'ok',
+      version: '0.1.0',
+      uptimeSec: Math.round(process.uptime()),
+      timestamp: new Date().toISOString(),
+    });
+  });
+
+  app.get('/ready', (_req, res) => {
+    let dataDirWritable = false;
     try {
-      const savedConfig = JSON.parse(fs.readFileSync(PORT_CONFIG_PATH, 'utf8')) as { port?: number };
-      const savedPort = Number(savedConfig.port);
-      if (Number.isInteger(savedPort) && savedPort >= 1024 && savedPort <= 65535) {
-        currentPort = savedPort;
-      }
+      const dir = getDataDir();
+      fs.accessSync(dir, fs.constants.W_OK);
+      dataDirWritable = true;
     } catch {
-      // First run: use the default port.
+      dataDirWritable = false;
     }
-  }
-  let server: ReturnType<typeof app.listen>;
+    const runningModels = engine.getRunningDeployments().length;
+    res.status(dataDirWritable ? 200 : 503).json({
+      ready: dataDirWritable,
+      dataDirWritable,
+      runningModels,
+    });
+  });
+
+  app.get('/api/diagnostics', (_req, res) => {
+    const cfg = loadOrInitConfig();
+    const snap = engine.getSnapshot();
+    res.json({
+      generatedAt: new Date().toISOString(),
+      version: '0.1.0',
+      nodeVersion: process.version,
+      platform: process.platform,
+      arch: process.arch,
+      uptimeSec: Math.round(process.uptime()),
+      config: {
+        schemaVersion: cfg.schemaVersion,
+        updatedAt: cfg.updatedAt,
+        pagedAttention: cfg.pagedAttention,
+        agentPermissions: cfg.agentPermissions,
+        secretsMasked: {
+          geminiApiKey: process.env.GEMINI_API_KEY ? maskSecretValue(process.env.GEMINI_API_KEY) : null,
+          hfToken: process.env.HF_TOKEN ? maskSecretValue(process.env.HF_TOKEN) : null,
+          modelscopeToken: process.env.MODELSCOPE_TOKEN ? maskSecretValue(process.env.MODELSCOPE_TOKEN) : null,
+        },
+      },
+      hardware: snap.hardware,
+      deployments: snap.deployments.map((d) => ({
+        id: d.id,
+        alias: d.alias,
+        baseModel: d.baseModel,
+        provider: d.provider,
+        status: d.status,
+        totalServed: d.totalServed,
+        totalErrors: d.totalErrors,
+        lastError: d.lastError,
+      })),
+      recentLogs: logger.getRecentLogs(100),
+    });
+  });
 
   app.get('/api/server/config', (_req, res) => {
     res.json({ host: HOST, port: currentPort, defaultPort: DEFAULT_PORT });
@@ -80,6 +158,7 @@ async function startServer() {
       return;
     }
 
+    const activeServer = options.getServer?.();
     const nextServer = app.listen(nextPort, HOST);
     nextServer.once('error', (err: NodeJS.ErrnoException) => {
       res.status(409).json({
@@ -100,19 +179,125 @@ async function startServer() {
         return;
       }
 
-      const previousServer = server;
-      server = nextServer;
+      options.setServer?.(nextServer);
       currentPort = nextPort;
       res.json({ port: currentPort, unchanged: false });
-      res.once('finish', () => previousServer.close());
+      if (activeServer) {
+        res.once('finish', () => activeServer.close());
+      }
     });
+  });
+
+  // =========================================================================
+  // Model OS / Filesystem & PowerShell Access Settings + Agent Chat (/api/access/*, /api/chat/agent)
+  // =========================================================================
+  app.get('/api/access/config', (_req, res) => {
+    res.json({
+      config: getAccessConfig(),
+      environment: detectShellEnvironment(true),
+    });
+  });
+
+  app.put('/api/access/config', (req, res) => {
+    try {
+      const updated = updateAccessConfig(req.body ?? {});
+      res.json({
+        config: updated,
+        environment: detectShellEnvironment(),
+      });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/access/reset', (_req, res) => {
+    res.json({
+      config: resetAccessConfig(),
+      environment: detectShellEnvironment(),
+    });
+  });
+
+  app.post('/api/access/test-path', (req, res) => {
+    try {
+      const target = String(req.body?.path ?? '');
+      res.json(testWorkspacePath(target));
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/access/logs', (_req, res) => {
+    res.json({ logs: getToolAuditLogs() });
+  });
+
+  app.delete('/api/access/logs', (_req, res) => {
+    clearToolAuditLogs();
+    res.json({ logs: [] });
+  });
+
+  app.post('/api/chat/agent', async (req, res) => {
+    const body = req.body ?? {};
+    let messages: OpenAiChatMessage[];
+    try {
+      messages = normalizeOpenAiMessages(body.messages);
+    } catch (err) {
+      res.status(400).json({
+        error: err instanceof Error ? err.message : 'Некорректный формат сообщений.',
+      });
+      return;
+    }
+
+    const deployment = engine.findDeploymentByModel(body.model);
+    if (!deployment) {
+      res.status(404).json({ error: `Модель "${body.model ?? ''}" не найдена на сервере.` });
+      return;
+    }
+    if (deployment.status !== 'running') {
+      res.status(503).json({
+        error: `Модель "${deployment.alias}" сейчас остановлена (статус: ${deployment.status}).`,
+      });
+      return;
+    }
+    if (deployment.capability !== 'text') {
+      res.status(400).json({ error: `Модель "${deployment.alias}" предназначена для эмбеддингов.` });
+      return;
+    }
+
+    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders?.();
+
+    const abortController = new AbortController();
+    req.on('close', () => {
+      abortController.abort();
+    });
+
+    await runAgentChatStream({
+      engine,
+      deployment,
+      messages,
+      userSystemPrompt: typeof body.systemPrompt === 'string' ? body.systemPrompt : undefined,
+      enableTools: body.enableTools !== false,
+      signal: abortController.signal,
+      emit: (evt) => {
+        if (!res.writableEnded) {
+          res.write(`data: ${JSON.stringify(evt)}\n\n`);
+        }
+      },
+    });
+
+    if (!res.writableEnded) {
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
   });
 
   // =========================================================================
   // OpenAI-Compatible Endpoints (/v1/*)
   // =========================================================================
   app.get('/v1/models', (_req, res) => {
-    const running = modelServer.getRunningDeployments();
+    const running = engine.getRunningDeployments();
     res.json({
       object: 'list',
       data: running.map((dep) => ({
@@ -128,37 +313,38 @@ async function startServer() {
 
   app.post('/v1/chat/completions', async (req, res) => {
     const body = req.body ?? {};
-    const messages = Array.isArray(body.messages) ? (body.messages as OpenAiChatMessage[]) : [];
-    if (messages.length === 0) {
-      res.status(400).json({
-        error: { message: 'Поле messages должно содержать хотя бы одно сообщение.', type: 'invalid_request_error' },
-      });
+    let messages: OpenAiChatMessage[];
+    try {
+      messages = normalizeOpenAiMessages(body.messages);
+    } catch (err) {
+      res.status(400).json(openAiError(err instanceof Error ? err.message : 'Некорректный формат messages.', 'invalid_request_error', 'messages'));
       return;
     }
 
-    const deployment = modelServer.findDeploymentByModel(body.model);
+    if (body.temperature !== undefined && (typeof body.temperature !== 'number' || body.temperature < 0 || body.temperature > 2)) {
+      res.status(400).json(openAiError('Параметр temperature должен быть числом от 0 до 2.', 'invalid_request_error', 'temperature'));
+      return;
+    }
+    if (body.top_p !== undefined && (typeof body.top_p !== 'number' || body.top_p <= 0 || body.top_p > 1)) {
+      res.status(400).json(openAiError('Параметр top_p должен быть числом в диапазоне (0, 1].', 'invalid_request_error', 'top_p'));
+      return;
+    }
+    if (body.n !== undefined && body.n !== 1) {
+      res.status(400).json(openAiError('Поддерживается только n=1.', 'invalid_request_error', 'n'));
+      return;
+    }
+
+    const deployment = engine.findDeploymentByModel(body.model);
     if (!deployment) {
-      res.status(404).json({
-        error: { message: `Модель "${body.model ?? ''}" не найдена на сервере.`, type: 'model_not_found' },
-      });
+      res.status(404).json(openAiError(`Модель "${body.model ?? ''}" не найдена на сервере.`, 'model_not_found', 'model', 'model_not_found'));
       return;
     }
     if (deployment.status !== 'running') {
-      res.status(503).json({
-        error: {
-          message: `Модель "${deployment.alias}" сейчас остановлена (статус: ${deployment.status}). Запустите её в панели моделей.`,
-          type: 'model_not_running',
-        },
-      });
+      res.status(503).json(openAiError(`Модель "${deployment.alias}" сейчас остановлена (статус: ${deployment.status}). Запустите её в панели моделей.`, 'model_not_running'));
       return;
     }
     if (deployment.capability !== 'text') {
-      res.status(400).json({
-        error: {
-          message: `Модель "${deployment.alias}" предназначена для эмбеддингов (/v1/embeddings).`,
-          type: 'invalid_request_error',
-        },
-      });
+      res.status(400).json(openAiError(`Модель "${deployment.alias}" предназначена для эмбеддингов (/v1/embeddings).`, 'invalid_request_error'));
       return;
     }
 
@@ -177,7 +363,7 @@ async function startServer() {
       0
     );
 
-    const record = modelServer.createRequestRecord({
+    const record = engine.createRequestRecord({
       deployment,
       endpoint: '/v1/chat/completions',
       stream,
@@ -189,16 +375,16 @@ async function startServer() {
     const startedAt = performance.now();
     const completionId = `chatcmpl-${record.id}`;
     const created = Math.floor(Date.now() / 1000);
-    const cacheKey = modelServer.computeCacheKey(deployment, { endpoint: 'chat', messages });
+    const cacheKey = engine.computeCacheKey(deployment, { endpoint: 'chat', messages });
     const textModel = deployment.baseModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
-    await modelServer.acquireSlot(deployment.id, record);
+    await engine.acquireSlot(deployment.id, record);
 
     try {
-      const cached = modelServer.lookupCache(deployment, cacheKey);
+      const cached = engine.lookupCache(deployment, cacheKey);
       if (cached) {
         const elapsedMs = Math.max(0.2, performance.now() - startedAt);
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: true,
           promptTokens: cached.promptTokens,
           completionTokens: cached.completionTokens,
@@ -306,7 +492,7 @@ async function startServer() {
               ttftMs = performance.now() - startedAt;
             }
             fullText += chunk.text;
-            modelServer.appendStreamTokens(record, chunk.text);
+            engine.appendStreamTokens(record, chunk.text);
             res.write(
               `data: ${JSON.stringify({
                 id: completionId,
@@ -333,13 +519,13 @@ async function startServer() {
           totalTokens = promptTokens + completionTokens;
         }
 
-        modelServer.storeCache(deployment, cacheKey, {
+        engine.storeCache(deployment, cacheKey, {
           text: fullText,
           promptTokens,
           completionTokens,
           totalTokens,
         });
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: false,
           promptTokens,
           completionTokens,
@@ -387,13 +573,13 @@ async function startServer() {
           result.usage.completionTokens || Math.max(1, Math.ceil(result.text.length / 4));
         const totalTokens = result.usage.totalTokens || promptTokens + completionTokens;
 
-        modelServer.storeCache(deployment, cacheKey, {
+        engine.storeCache(deployment, cacheKey, {
           text: result.text,
           promptTokens,
           completionTokens,
           totalTokens,
         });
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: false,
           promptTokens,
           completionTokens,
@@ -421,7 +607,7 @@ async function startServer() {
       }
     } catch (err) {
       const mapped = formatGeminiError(err);
-      modelServer.markRequestError(
+      engine.markRequestError(
         deployment.id,
         record,
         mapped.message,
@@ -439,7 +625,7 @@ async function startServer() {
         });
       }
     } finally {
-      modelServer.releaseSlot(deployment.id);
+      engine.releaseSlot(deployment.id);
     }
   });
 
@@ -453,7 +639,7 @@ async function startServer() {
       return;
     }
 
-    const deployment = modelServer.findDeploymentByModel(body.model);
+    const deployment = engine.findDeploymentByModel(body.model);
     if (!deployment) {
       res.status(404).json({
         error: { message: `Модель "${body.model ?? ''}" не найдена на сервере.`, type: 'model_not_found' },
@@ -474,7 +660,7 @@ async function startServer() {
     }
 
     const stream = Boolean(body.stream);
-    const record = modelServer.createRequestRecord({
+    const record = engine.createRequestRecord({
       deployment,
       endpoint: '/v1/completions',
       stream,
@@ -486,16 +672,16 @@ async function startServer() {
     const completionId = `cmpl-${record.id}`;
     const created = Math.floor(Date.now() / 1000);
     const messages: OpenAiChatMessage[] = [{ role: 'user', content: prompt }];
-    const cacheKey = modelServer.computeCacheKey(deployment, { endpoint: 'completions', prompt });
+    const cacheKey = engine.computeCacheKey(deployment, { endpoint: 'completions', prompt });
     const textModel = deployment.baseModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
-    await modelServer.acquireSlot(deployment.id, record);
+    await engine.acquireSlot(deployment.id, record);
 
     try {
-      const cached = modelServer.lookupCache(deployment, cacheKey);
+      const cached = engine.lookupCache(deployment, cacheKey);
       if (cached) {
         const elapsedMs = Math.max(0.2, performance.now() - startedAt);
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: true,
           promptTokens: cached.promptTokens,
           completionTokens: cached.completionTokens,
@@ -569,7 +755,7 @@ async function startServer() {
           if (chunk.text) {
             if (ttftMs === null) ttftMs = performance.now() - startedAt;
             fullText += chunk.text;
-            modelServer.appendStreamTokens(record, chunk.text);
+            engine.appendStreamTokens(record, chunk.text);
             res.write(
               `data: ${JSON.stringify({
                 id: completionId,
@@ -593,13 +779,13 @@ async function startServer() {
         }
         if (totalTokens === 0) totalTokens = promptTokens + completionTokens;
 
-        modelServer.storeCache(deployment, cacheKey, {
+        engine.storeCache(deployment, cacheKey, {
           text: fullText,
           promptTokens,
           completionTokens,
           totalTokens,
         });
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: false,
           promptTokens,
           completionTokens,
@@ -646,13 +832,13 @@ async function startServer() {
           result.usage.completionTokens || Math.max(1, Math.ceil(result.text.length / 4));
         const totalTokens = result.usage.totalTokens || promptTokens + completionTokens;
 
-        modelServer.storeCache(deployment, cacheKey, {
+        engine.storeCache(deployment, cacheKey, {
           text: result.text,
           promptTokens,
           completionTokens,
           totalTokens,
         });
-        modelServer.markRequestCompleted(deployment.id, record, {
+        engine.markRequestCompleted(deployment.id, record, {
           cacheHit: false,
           promptTokens,
           completionTokens,
@@ -676,7 +862,7 @@ async function startServer() {
       }
     } catch (err) {
       const mapped = formatGeminiError(err);
-      modelServer.markRequestError(
+      engine.markRequestError(
         deployment.id,
         record,
         mapped.message,
@@ -692,7 +878,7 @@ async function startServer() {
         res.status(mapped.status).json({ error: { message: mapped.message, type: 'api_error' } });
       }
     } finally {
-      modelServer.releaseSlot(deployment.id);
+      engine.releaseSlot(deployment.id);
     }
   });
 
@@ -712,7 +898,7 @@ async function startServer() {
       return;
     }
 
-    const deployment = modelServer.findDeploymentByModel(body.model ?? 'text-embedding-v2');
+    const deployment = engine.findDeploymentByModel(body.model ?? 'text-embedding-v2');
     if (!deployment || deployment.capability !== 'embedding') {
       res.status(404).json({
         error: { message: 'Модель эмбеддингов не найдена. Запустите модель gemini-embedding-2.', type: 'model_not_found' },
@@ -726,19 +912,19 @@ async function startServer() {
       return;
     }
 
-    const record = modelServer.createRequestRecord({
+    const record = engine.createRequestRecord({
       deployment,
       endpoint: '/v1/embeddings',
       stream: false,
       promptPreview: inputs[0],
     });
     const startedAt = performance.now();
-    await modelServer.acquireSlot(deployment.id, record);
+    await engine.acquireSlot(deployment.id, record);
 
     try {
       const { embeddings, totalTokens } = await generateGeminiEmbeddings(inputs);
       const durationMs = performance.now() - startedAt;
-      modelServer.markRequestCompleted(deployment.id, record, {
+      engine.markRequestCompleted(deployment.id, record, {
         cacheHit: false,
         promptTokens: totalTokens,
         completionTokens: 0,
@@ -762,7 +948,7 @@ async function startServer() {
       });
     } catch (err) {
       const mapped = formatGeminiError(err);
-      modelServer.markRequestError(
+      engine.markRequestError(
         deployment.id,
         record,
         mapped.message,
@@ -770,7 +956,7 @@ async function startServer() {
       );
       res.status(mapped.status).json({ error: { message: mapped.message, type: 'api_error' } });
     } finally {
-      modelServer.releaseSlot(deployment.id);
+      engine.releaseSlot(deployment.id);
     }
   });
 
@@ -778,7 +964,7 @@ async function startServer() {
   // Model Lifecycle & Real Telemetry Endpoints (/api/*)
   // =========================================================================
   app.get('/api/engine/state', (_req, res) => {
-    res.json(modelServer.getSnapshot());
+    res.json(engine.getSnapshot());
   });
 
   app.get('/api/engine/stream', (req, res) => {
@@ -787,8 +973,8 @@ async function startServer() {
     res.setHeader('Connection', 'keep-alive');
     res.flushHeaders?.();
 
-    res.write(`data: ${JSON.stringify(modelServer.getSnapshot())}\n\n`);
-    const unsubscribe = modelServer.subscribe((snap) => {
+    res.write(`data: ${JSON.stringify(engine.getSnapshot())}\n\n`);
+    const unsubscribe = engine.subscribe((snap) => {
       res.write(`data: ${JSON.stringify(snap)}\n\n`);
     });
     req.on('close', unsubscribe);
@@ -796,8 +982,8 @@ async function startServer() {
 
   app.post('/api/deployments', async (req, res) => {
     try {
-      const dep = await modelServer.createAndLaunchDeployment(req.body ?? {});
-      res.status(201).json({ deployment: dep, snapshot: modelServer.getSnapshot() });
+      const dep = await engine.createAndLaunchDeployment(req.body ?? {});
+      res.status(201).json({ deployment: dep, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -805,8 +991,8 @@ async function startServer() {
 
   app.post('/api/deployments/:id/start', async (req, res) => {
     try {
-      const dep = await modelServer.startDeployment(req.params.id, true);
-      res.json({ deployment: dep, snapshot: modelServer.getSnapshot() });
+      const dep = await engine.startDeployment(req.params.id, true);
+      res.json({ deployment: dep, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -814,8 +1000,8 @@ async function startServer() {
 
   app.post('/api/deployments/:id/stop', async (req, res) => {
     try {
-      const dep = await modelServer.stopDeployment(req.params.id);
-      res.json({ deployment: dep, snapshot: modelServer.getSnapshot() });
+      const dep = await engine.stopDeployment(req.params.id);
+      res.json({ deployment: dep, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -823,8 +1009,8 @@ async function startServer() {
 
   app.patch('/api/deployments/:id', (req, res) => {
     try {
-      const dep = modelServer.updateDeployment(req.params.id, req.body ?? {});
-      res.json({ deployment: dep, snapshot: modelServer.getSnapshot() });
+      const dep = engine.updateDeployment(req.params.id, req.body ?? {});
+      res.json({ deployment: dep, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -832,25 +1018,25 @@ async function startServer() {
 
   app.delete('/api/deployments/:id', async (req, res) => {
     try {
-      await modelServer.deleteDeployment(req.params.id);
-      res.json({ snapshot: modelServer.getSnapshot() });
+      await engine.deleteDeployment(req.params.id);
+      res.json({ snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
   app.post('/api/engine/cache/clear', (_req, res) => {
-    res.json(modelServer.clearCache());
+    res.json(engine.clearCache());
   });
 
   app.post('/api/engine/logs/clear', (_req, res) => {
-    res.json(modelServer.clearLogs());
+    res.json(engine.clearLogs());
   });
 
   app.post('/api/engine/paged-config', (req, res) => {
     const body = req.body ?? {};
     res.json(
-      modelServer.updatePagedConfig({
+      engine.updatePagedConfig({
         blockSize: body.blockSize,
         totalBlocks: body.totalBlocks,
         kvMemoryUtilization: body.kvMemoryUtilization,
@@ -867,7 +1053,7 @@ async function startServer() {
   app.get('/api/hardware', async (req, res) => {
     try {
       const force = req.query.refresh === '1' || req.query.refresh === 'true';
-      const snapshot = await modelServer.refreshHardwareAndModels(force);
+      const snapshot = await engine.refreshHardwareAndModels(force);
       res.json({ hardware: snapshot.hardware, snapshot });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
@@ -928,8 +1114,8 @@ async function startServer() {
 
   app.get('/api/gguf/local', async (_req, res) => {
     try {
-      await modelServer.refreshLocalModels();
-      res.json({ localModels: modelServer.getSnapshot().localModels });
+      await engine.refreshLocalModels();
+      res.json({ localModels: engine.getSnapshot().localModels });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -938,35 +1124,91 @@ async function startServer() {
   app.delete('/api/gguf/local/:id', async (req, res) => {
     try {
       downloadManager.deleteLocalModel(req.params.id);
-      await modelServer.refreshLocalModels();
-      res.json({ snapshot: modelServer.getSnapshot() });
+      await engine.refreshLocalModels();
+      res.json({ snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
-  app.post('/api/gguf/install-runtime', async (_req, res) => {
+  app.post('/api/gguf/install-runtime', async (req, res) => {
     try {
-      const result = await installLlamaServerRuntime();
-      const snapshot = await modelServer.refreshHardwareAndModels(true);
+      const rawBackend = String(req.body?.backend ?? 'auto');
+      const backend: LlamaBackendPreference =
+        rawBackend === 'cpu' || rawBackend === 'cuda' || rawBackend === 'vulkan'
+          ? rawBackend
+          : 'auto';
+      const result = await installLlamaServerRuntime(backend);
+      const snapshot = await engine.refreshHardwareAndModels(true);
       res.json({ ...result, snapshot });
     } catch (err) {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   });
 
+  app.get('/api/gguf/archives', async (_req, res) => {
+    try {
+      const hw = await detectHardwareProfile(true);
+      res.json({
+        archives: hw.localArchives,
+        vendorArchivesDir: hw.vendorArchivesDir,
+        archivesDir: hw.archivesDir,
+      });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/gguf/install-from-archive', async (req, res) => {
+    try {
+      const archivePath = String(req.body?.archivePath ?? '').trim();
+      if (!archivePath) {
+        res.status(400).json({ error: 'Укажите путь или имя архива llama-server.' });
+        return;
+      }
+      const result = await installLlamaServerFromArchive({ archivePath });
+      const snapshot = await engine.refreshHardwareAndModels(true);
+      res.json({ ...result, snapshot });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post(
+    '/api/gguf/upload-archive',
+    express.raw({ type: 'application/octet-stream', limit: '350mb' }),
+    async (req, res) => {
+      try {
+        const fileNameHeader = String(req.headers['x-archive-name'] ?? 'llama-server.zip');
+        const buf = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+        if (buf.length === 0) {
+          res.status(400).json({ error: 'Пустое тело архива.' });
+          return;
+        }
+        const result = await installLlamaServerFromArchive({
+          fileName: fileNameHeader,
+          buffer: buf,
+        });
+        const snapshot = await engine.refreshHardwareAndModels(true);
+        res.json({ ...result, snapshot });
+      } catch (err) {
+        res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+  );
+
   app.get('/api/downloads', (_req, res) => {
     res.json({ downloads: downloadManager.getJobs() });
   });
 
-  app.post('/api/downloads', (req, res) => {
+  app.post('/api/downloads', async (req, res) => {
     try {
       const body = req.body ?? {};
       if (!body.downloadUrl || !body.fileName) {
         res.status(400).json({ error: 'Необходимо указать downloadUrl и fileName.' });
         return;
       }
-      const job = downloadManager.startDownload({
+      const job = await downloadManager.startDownload({
         source: (body.source as HubSource) ?? 'url',
         repoId: String(body.repoId ?? body.fileName),
         fileName: String(body.fileName),
@@ -974,7 +1216,7 @@ async function startServer() {
         totalBytes: typeof body.totalBytes === 'number' ? body.totalBytes : null,
         quantization: typeof body.quantization === 'string' ? body.quantization : undefined,
       });
-      res.status(201).json({ job, snapshot: modelServer.getSnapshot() });
+      res.status(201).json({ job, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -983,7 +1225,7 @@ async function startServer() {
   app.post('/api/downloads/:id/pause', (req, res) => {
     try {
       const job = downloadManager.pauseDownload(req.params.id);
-      res.json({ job, snapshot: modelServer.getSnapshot() });
+      res.json({ job, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -992,7 +1234,7 @@ async function startServer() {
   app.post('/api/downloads/:id/resume', (req, res) => {
     try {
       const job = downloadManager.resumeDownload(req.params.id);
-      res.json({ job, snapshot: modelServer.getSnapshot() });
+      res.json({ job, snapshot: engine.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
     }
@@ -1000,26 +1242,58 @@ async function startServer() {
 
   app.delete('/api/downloads/:id', (req, res) => {
     downloadManager.cancelDownload(req.params.id);
-    res.json({ snapshot: modelServer.getSnapshot() });
+    res.json({ snapshot: engine.getSnapshot() });
   });
 
   // =========================================================================
   // Vite Middleware (Dev) or Static Dist (Prod / Standalone Binary)
   // =========================================================================
-  if (process.env.NODE_ENV === 'production') {
-    const distDir = resolvePublicDistDir();
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  if (options.enableVite !== false) {
+    if (process.env.NODE_ENV === 'production') {
+      const distDir = resolvePublicDistDir();
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
   }
+
+  return app;
+}
+
+async function startServer() {
+  const HOST = process.env.HOST || '127.0.0.1';
+  let currentPort = Number(process.env.PORT) || DEFAULT_PORT;
+  if (!process.env.PORT) {
+    try {
+      const savedConfig = JSON.parse(fs.readFileSync(PORT_CONFIG_PATH, 'utf8')) as { port?: number };
+      const savedPort = Number(savedConfig.port);
+      if (Number.isInteger(savedPort) && savedPort >= 1024 && savedPort <= 65535) {
+        currentPort = savedPort;
+      }
+    } catch {
+      // First run: use the default port.
+    }
+  }
+
+  let server: ReturnType<express.Express['listen']> | undefined;
+  const app = await createGatewayApp({
+    engine: modelServer,
+    enableVite: true,
+    host: HOST,
+    initialPort: currentPort,
+    getServer: () => server,
+    setServer: (next) => {
+      server = next;
+    },
+  });
 
   server = app.listen(currentPort, HOST, () => {
     console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
@@ -1027,13 +1301,15 @@ async function startServer() {
 
   const handleSignal = () => {
     modelServer.shutdown();
-    server.close(() => process.exit(0));
+    server?.close(() => process.exit(0));
   };
   process.on('SIGINT', handleSignal);
   process.on('SIGTERM', handleSignal);
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start vLLM Gateway Server:', err);
-  process.exit(1);
-});
+if (process.env.VLLM_NO_LISTEN !== '1') {
+  startServer().catch((err) => {
+    console.error('Failed to start vLLM Gateway Server:', err);
+    process.exit(1);
+  });
+}

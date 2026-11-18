@@ -8,7 +8,7 @@ export function isGeminiApiKeyConfigured(): boolean {
   return Boolean(apiKey && apiKey.trim().length > 0 && apiKey !== 'MY_GEMINI_API_KEY');
 }
 
-function getGeminiClient(): GoogleGenAI {
+export function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
@@ -55,7 +55,7 @@ export interface GeminiStreamChunk {
   usage?: GeminiUsage;
 }
 
-function mapThinkingLevel(level?: ThinkingLevelOption): ThinkingLevel {
+export function mapThinkingLevel(level?: ThinkingLevelOption): ThinkingLevel {
   if (level === 'HIGH') return ThinkingLevel.HIGH;
   if (level === 'MEDIUM') return ThinkingLevel.MEDIUM;
   return ThinkingLevel.LOW;

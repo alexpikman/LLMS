@@ -229,6 +229,14 @@ export async function queryLlamaSlots(deploymentId: string): Promise<RawLlamaSlo
   }
 }
 
+export function getGgufProcessPort(deploymentId: string): number {
+  const inst = runningProcesses.get(deploymentId);
+  if (!inst || inst.process.exitCode !== null) {
+    throw new Error('Локальный процесс llama-server не запущен.');
+  }
+  return inst.port;
+}
+
 export async function* streamGgufChat(params: {
   deploymentId: string;
   messages: OpenAiChatMessage[];

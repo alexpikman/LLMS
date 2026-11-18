@@ -312,3 +312,52 @@ export interface ServerSnapshot {
   localModels: LocalGgufModel[];
   downloads: ModelDownloadJob[];
 }
+
+export type ShellPreference = 'auto' | 'powershell' | 'bash';
+
+export interface AgentPermissionsConfig {
+  enabled: boolean;
+  workspaceRoot: string;
+  restrictToWorkspace: boolean;
+  allowReadFiles: boolean;
+  allowCreateFiles: boolean;
+  allowEditFiles: boolean;
+  allowDeleteFiles: boolean;
+  allowShell: boolean;
+  shellPreference: ShellPreference;
+  shellTimeoutMs: number;
+  maxFileSizeKb: number;
+  maxToolIterations: number;
+  blockedCommandPatterns: string[];
+}
+
+export interface DetectedShellEnvironment {
+  platform: string;
+  defaultWorkspaceRoot: string;
+  powershellAvailable: boolean;
+  powershellBinary: string | null;
+  bashAvailable: boolean;
+}
+
+export interface ToolAuditEntry {
+  id: string;
+  timestampMs: number;
+  modelAlias: string;
+  toolName: string;
+  argsSummary: string;
+  allowed: boolean;
+  status: 'completed' | 'blocked' | 'error';
+  durationMs: number;
+  resultPreview: string;
+  error?: string;
+}
+
+export interface AgentToolStep {
+  id: string;
+  toolName: string;
+  args: Record<string, unknown>;
+  status: 'running' | 'completed' | 'blocked' | 'error';
+  durationMs?: number;
+  output?: string;
+  error?: string;
+}

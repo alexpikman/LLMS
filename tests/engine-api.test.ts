@@ -10,17 +10,17 @@ process.env.NODE_ENV = 'test';
 
 const { createGatewayApp } = await import('../server.ts');
 const { ModelServerRuntime } = await import('../server/engine.ts');
-const { AuthManager } = await import('../server/security.ts');
+const { executeWorkspaceTool, updateAccessConfig } = await import('../server/workspaceTools.ts');
 
 const cleanupFns: Array<() => Promise<void> | void> = [];
 
 async function bootTestServer() {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vllm-api-test-'));
+  const workDir = fs.mkdtempSync(path.join(os.tmpdir(), 'vllm-work-test-'));
   process.env.VLLM_DATA_DIR = tmpDir;
 
   const engine = new ModelServerRuntime({ skipBackgroundInit: true, dataDir: tmpDir });
-  const authManager = new AuthManager(tmpDir);
-  const app = await createGatewayApp({ engine, authManager, enableVite: false });
+  const app = await createGatewayApp({ engine, enableVite: false });
 
   const server = await new Promise<http.Server>((resolve) => {
     const s = app.listen(0, '127.0.0.1', () => resolve(s));
@@ -34,9 +34,10 @@ async function bootTestServer() {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.VLLM_DATA_DIR;
     fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(workDir, { recursive: true, force: true });
   });
 
-  return { baseUrl, engine, authManager };
+  return { baseUrl, engine, tmpDir, workDir };
 }
 
 afterEach(async () => {
@@ -46,8 +47,8 @@ afterEach(async () => {
   }
 });
 
-describe('Gateway HTTP API Security & OpenAI Compliance', () => {
-  it('exposes /health and /ready publicly and protects /v1/* and /api/*', async () => {
+describe('Tokenless Gateway HTTP API, OpenAI Validation & Diagnostics', () => {
+  it('exposes /health, /ready, /v1/models, /api/engine/state and /api/diagnostics without tokens', async () => {
     const { baseUrl } = await bootTestServer();
 
     const healthRes = await fetch(`${baseUrl}/health`);
@@ -62,82 +63,34 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     assert.equal(ready.ready, true);
     assert.equal(ready.dataDirWritable, true);
 
-    const unauthModels = await fetch(`${baseUrl}/v1/models`);
-    assert.equal(unauthModels.status, 401);
-    const unauthJson = (await unauthModels.json()) as { error?: { code?: string } };
-    assert.equal(unauthJson.error?.code, 'invalid_api_key');
-
-    const unauthState = await fetch(`${baseUrl}/api/engine/state`);
-    assert.equal(unauthState.status, 401);
-  });
-
-  it('completes setup once, authenticates via Bearer token & session cookie, and validates OpenAI payloads', async () => {
-    const { baseUrl } = await bootTestServer();
-
-    const statusBefore = (await (await fetch(`${baseUrl}/api/auth/status`)).json()) as {
-      setupRequired: boolean;
-      authenticated: boolean;
-    };
-    assert.equal(statusBefore.setupRequired, true);
-    assert.equal(statusBefore.authenticated, false);
-
-    const setupRes = await fetch(`${baseUrl}/api/auth/setup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    assert.equal(setupRes.status, 201);
-    const setupJson = (await setupRes.json()) as { token: string };
-    assert.ok(setupJson.token.startsWith('sk-vllm-'));
-
-    // Second setup attempt must fail with 409
-    const secondSetup = await fetch(`${baseUrl}/api/auth/setup`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({}),
-    });
-    assert.equal(secondSetup.status, 409);
-
-    // Bearer access works on /v1/models
-    const modelsRes = await fetch(`${baseUrl}/v1/models`, {
-      headers: { Authorization: `Bearer ${setupJson.token}` },
-    });
+    const modelsRes = await fetch(`${baseUrl}/v1/models`);
     assert.equal(modelsRes.status, 200);
     const modelsJson = (await modelsRes.json()) as { data: Array<{ id: string }> };
     assert.ok(modelsJson.data.some((m) => m.id === 'hydrogen-chat'));
 
-    // Cookie login flow
-    const loginRes = await fetch(`${baseUrl}/api/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ token: setupJson.token }),
-    });
-    assert.equal(loginRes.status, 200);
-    const cookie = loginRes.headers.get('set-cookie')?.split(';')[0] ?? '';
-    assert.ok(cookie.startsWith('vllm_session='));
+    const stateRes = await fetch(`${baseUrl}/api/engine/state`);
+    assert.equal(stateRes.status, 200);
 
-    const cookieModels = await fetch(`${baseUrl}/v1/models`, {
-      headers: { Cookie: cookie },
-    });
-    assert.equal(cookieModels.status, 200);
+    const diagRes = await fetch(`${baseUrl}/api/diagnostics`);
+    assert.equal(diagRes.status, 200);
+    const diag = (await diagRes.json()) as { version: string; config: { schemaVersion: number } };
+    assert.equal(diag.version, '0.1.0');
+    assert.ok(diag.config.schemaVersion >= 2);
+  });
 
-    // OpenAI parameter validation (400 / 404)
+  it('validates OpenAI parameters and rejects SSRF download targets cleanly', async () => {
+    const { baseUrl } = await bootTestServer();
+
     const emptyMsgs = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${setupJson.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'hydrogen-chat', messages: [] }),
     });
     assert.equal(emptyMsgs.status, 400);
 
     const badTemp = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${setupJson.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'hydrogen-chat',
         temperature: 4.5,
@@ -148,10 +101,7 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
 
     const badN = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${setupJson.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'hydrogen-chat',
         n: 2,
@@ -162,10 +112,7 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
 
     const unknownModel = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: 'POST',
-      headers: {
-        Authorization: `Bearer ${setupJson.token}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: 'non-existent-model',
         messages: [{ role: 'user', content: 'hi' }],
@@ -173,15 +120,17 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     });
     assert.equal(unknownModel.status, 404);
 
-    // Diagnostics never leaks raw token
-    const diagRes = await fetch(`${baseUrl}/api/diagnostics`, {
-      headers: { Authorization: `Bearer ${setupJson.token}` },
+    // SSRF target rejection on POST /api/downloads must return 400 asynchronously
+    const ssrfRes = await fetch(`${baseUrl}/api/downloads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'url',
+        fileName: 'evil.gguf',
+        downloadUrl: 'http://127.0.0.1:8080/evil.gguf',
+      }),
     });
-    assert.equal(diagRes.status, 200);
-    const diagText = await diagRes.text();
-    assert.equal(diagText.includes(setupJson.token), false);
-    assert.equal(diagText.includes('tokenHash'), false);
-    assert.equal(diagText.includes('sessionSecret'), false);
+    assert.equal(ssrfRes.status, 400);
   });
 
   it('enforces ModelServerRuntime scheduler queue, SHA-256 RAM cache, and PagedAttention slot lifecycle', async () => {
@@ -189,7 +138,6 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     const dep = engine.findDeploymentByModel('hydrogen-chat');
     assert.ok(dep);
 
-    // Restrict concurrency to 1 and verify second waiter blocks until releaseSlot
     engine.updatePagedConfig({ maxNumSeqs: 1 });
     const req1 = engine.createRequestRecord({
       deployment: dep,
@@ -229,7 +177,6 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     assert.equal(secondAcquired, true);
     engine.releaseSlot(dep.id);
 
-    // Verify RAM response cache
     const key = engine.computeCacheKey(dep, { messages: [{ role: 'user', content: 'ping' }] });
     engine.storeCache(dep, key, {
       text: 'pong',
@@ -240,5 +187,126 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     const hit = engine.lookupCache(dep, key);
     assert.equal(hit?.text, 'pong');
     assert.equal(engine.getSnapshot().cacheHitsTotal, 1);
+  });
+});
+
+describe('Model OS Access Settings & Workspace Tools Execution', () => {
+  it('persists access settings via /api/access/config and executes file + shell tools safely', async () => {
+    const { baseUrl, tmpDir, workDir } = await bootTestServer();
+
+    // Configure workspace root via HTTP API
+    const putRes = await fetch(`${baseUrl}/api/access/config`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        enabled: true,
+        workspaceRoot: workDir,
+        restrictToWorkspace: true,
+        allowReadFiles: true,
+        allowCreateFiles: true,
+        allowEditFiles: true,
+        allowDeleteFiles: false,
+        allowShell: true,
+      }),
+    });
+    assert.equal(putRes.status, 200);
+    const putJson = (await putRes.json()) as { config: { workspaceRoot: string; allowDeleteFiles: boolean } };
+    assert.equal(putJson.config.workspaceRoot, path.resolve(workDir));
+    assert.equal(putJson.config.allowDeleteFiles, false);
+
+    // 1. Create file
+    const created = await executeWorkspaceTool({
+      toolName: 'create_file',
+      args: { path: 'notes/demo.txt', content: 'line one\nline two\n' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(created.ok, true);
+    assert.equal(fs.existsSync(path.join(workDir, 'notes/demo.txt')), true);
+
+    // 2. Edit file (replace)
+    const edited = await executeWorkspaceTool({
+      toolName: 'edit_file',
+      args: { path: 'notes/demo.txt', mode: 'replace', oldText: 'line two', newText: 'line TWO updated' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(edited.ok, true);
+    assert.ok(fs.readFileSync(path.join(workDir, 'notes/demo.txt'), 'utf8').includes('line TWO updated'));
+
+    // 3. Read file & list_files
+    const readRes = await executeWorkspaceTool({
+      toolName: 'read_file',
+      args: { path: 'notes/demo.txt' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(readRes.ok, true);
+    assert.ok(readRes.output.includes('line TWO updated'));
+
+    const listRes = await executeWorkspaceTool({
+      toolName: 'list_files',
+      args: { path: '.', recursive: true },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(listRes.ok, true);
+    assert.ok(listRes.output.includes('notes/demo.txt'));
+
+    // 4. Delete blocked when allowDeleteFiles === false
+    const blockedDelete = await executeWorkspaceTool({
+      toolName: 'delete_file',
+      args: { path: 'notes/demo.txt' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(blockedDelete.ok, false);
+    assert.equal(blockedDelete.status, 'blocked');
+
+    // 5. Path traversal outside workspace blocked
+    const escapeRes = await executeWorkspaceTool({
+      toolName: 'read_file',
+      args: { path: '../outside-secret.txt' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(escapeRes.ok, false);
+
+    // 6. Shell command execution & blocked pattern enforcement
+    const shellOk = await executeWorkspaceTool({
+      toolName: 'run_powershell',
+      args: { command: 'echo vllm-shell-ok' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(shellOk.ok, true);
+    assert.ok(shellOk.output.includes('vllm-shell-ok'));
+
+    const shellBlocked = await executeWorkspaceTool({
+      toolName: 'run_powershell',
+      args: { command: 'rm -rf /' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(shellBlocked.ok, false);
+    assert.equal(shellBlocked.status, 'blocked');
+
+    // 7. Enable delete and verify delete_file works
+    updateAccessConfig({ allowDeleteFiles: true }, tmpDir);
+    const deleteOk = await executeWorkspaceTool({
+      toolName: 'delete_file',
+      args: { path: 'notes/demo.txt' },
+      modelAlias: 'hydrogen-chat',
+      dataDir: tmpDir,
+    });
+    assert.equal(deleteOk.ok, true);
+    assert.equal(fs.existsSync(path.join(workDir, 'notes/demo.txt')), false);
+
+    // 8. Audit logs captured
+    const logsRes = await fetch(`${baseUrl}/api/access/logs`);
+    assert.equal(logsRes.status, 200);
+    const logsJson = (await logsRes.json()) as { logs: Array<{ toolName: string }> };
+    assert.ok(logsJson.logs.some((l) => l.toolName === 'create_file'));
+    assert.ok(logsJson.logs.some((l) => l.toolName === 'run_powershell'));
   });
 });
