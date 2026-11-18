@@ -70,21 +70,21 @@ $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<
 
 ### Запуск из исходников и сборка бинарного файла
 
-Требования: **Node.js 22+**, **npm**.
+Требования: **Node.js 22+**, **Bun**.
 
 ```bash
-# 1. Установка зависимостей
-npm install
+# 1. Установка зависимостей по bun.lock
+bun install --frozen-lockfile
 
 # 2. Режим разработки (Express + Vite HMR-middleware на порту 3000)
-npm run dev
+bun run dev
 
 # 3. Продакшен-сборка фронтенда и запуск Node-сервера
-npm run build
+bun run build
 NODE_ENV=production npm start
 
 # 4. Сборка автономного бинарника (Node.js Single Executable Application)
-npm run build:release
+bun run build:release
 # Результат находится в папке ./release-build/
 ```
 
@@ -189,21 +189,21 @@ Open **`http://localhost:3000`** in your browser.
 
 ### Build from Source & Package Standalone Binary
 
-Requirements: **Node.js 22+**, **npm**.
+Requirements: **Node.js 22+**, **Bun**.
 
 ```bash
-# Install dependencies
-npm install
+# Install dependencies from bun.lock
+bun install --frozen-lockfile
 
 # Run in development mode (Express + Vite middleware on port 3000)
-npm run dev
+bun run dev
 
 # Production build & start
-npm run build
+bun run build
 NODE_ENV=production npm start
 
 # Build standalone Node.js SEA executable + dist/ in ./release-build/
-npm run build:release
+bun run build:release
 ```
 
 To trigger automated multi-platform GitHub Release builds (`linux-x64`, `linux-arm64`, `macos-arm64`, `win-x64`), push a version tag:
