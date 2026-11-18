@@ -308,7 +308,16 @@ export async function createGatewayApp(options: {
     try {
       await modelServer.acquireSlot(deployment.id, record, streamAbortController?.signal);
     } catch (err) {
-      if (streamAbortController?.signal.aborted) return;
+      if (streamAbortController?.signal.aborted) {
+        res.off('close', abortOnDisconnect);
+        modelServer.markRequestError(
+          deployment.id,
+          record,
+          'Клиент прервал запрос до получения слота инференса.',
+          performance.now() - startedAt
+        );
+        return;
+      }
       throw err;
     }
 
@@ -625,7 +634,16 @@ export async function createGatewayApp(options: {
     try {
       await modelServer.acquireSlot(deployment.id, record, streamAbortController?.signal);
     } catch (err) {
-      if (streamAbortController?.signal.aborted) return;
+      if (streamAbortController?.signal.aborted) {
+        res.off('close', abortOnDisconnect);
+        modelServer.markRequestError(
+          deployment.id,
+          record,
+          'Клиент прервал запрос до получения слота инференса.',
+          performance.now() - startedAt
+        );
+        return;
+      }
       throw err;
     }
 
