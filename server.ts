@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -24,7 +25,9 @@ import type { HubSource } from './src/types/engine.ts';
 
 const __filename = typeof import.meta?.url === 'string' ? fileURLToPath(import.meta.url) : '';
 const __dirname = __filename ? path.dirname(__filename) : process.cwd();
-const PORT = Number(process.env.PORT) || 3000;
+const DEFAULT_PORT = 3003;
+const PORT_CONFIG_DIR = process.env.VLLM_DATA_DIR || path.join(os.homedir(), '.vllm-gateway');
+const PORT_CONFIG_PATH = path.join(PORT_CONFIG_DIR, 'server-config.json');
 
 function resolvePublicDistDir(): string {
   const candidates = [
@@ -46,6 +49,64 @@ function resolvePublicDistDir(): string {
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+
+  const HOST = process.env.HOST || '127.0.0.1';
+  let currentPort = Number(process.env.PORT) || DEFAULT_PORT;
+  if (!process.env.PORT) {
+    try {
+      const savedConfig = JSON.parse(fs.readFileSync(PORT_CONFIG_PATH, 'utf8')) as { port?: number };
+      const savedPort = Number(savedConfig.port);
+      if (Number.isInteger(savedPort) && savedPort >= 1024 && savedPort <= 65535) {
+        currentPort = savedPort;
+      }
+    } catch {
+      // First run: use the default port.
+    }
+  }
+  let server: ReturnType<typeof app.listen>;
+
+  app.get('/api/server/config', (_req, res) => {
+    res.json({ host: HOST, port: currentPort, defaultPort: DEFAULT_PORT });
+  });
+
+  app.put('/api/server/config', (req, res) => {
+    const nextPort = Number(req.body?.port);
+    if (!Number.isInteger(nextPort) || nextPort < 1024 || nextPort > 65535) {
+      res.status(400).json({ error: 'Порт должен быть целым числом от 1024 до 65535.' });
+      return;
+    }
+    if (nextPort === currentPort) {
+      res.json({ port: currentPort, unchanged: true });
+      return;
+    }
+
+    const nextServer = app.listen(nextPort, HOST);
+    nextServer.once('error', (err: NodeJS.ErrnoException) => {
+      res.status(409).json({
+        error: err.code === 'EADDRINUSE'
+          ? `Порт ${nextPort} уже занят. Выберите другой порт.`
+          : `Не удалось открыть порт ${nextPort}: ${err.message}`,
+      });
+    });
+    nextServer.once('listening', () => {
+      try {
+        fs.mkdirSync(PORT_CONFIG_DIR, { recursive: true });
+        fs.writeFileSync(PORT_CONFIG_PATH, JSON.stringify({ port: nextPort }, null, 2), 'utf8');
+      } catch (err) {
+        nextServer.close();
+        res.status(500).json({
+          error: err instanceof Error ? err.message : 'Не удалось сохранить настройки порта.',
+        });
+        return;
+      }
+
+      const previousServer = server;
+      server = nextServer;
+      currentPort = nextPort;
+      res.json({ port: currentPort, unchanged: false });
+      res.once('finish', () => previousServer.close());
+    });
+  });
 
   // =========================================================================
   // OpenAI-Compatible Endpoints (/v1/*)
@@ -960,8 +1021,8 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`vLLM Gateway Server listening on http://0.0.0.0:${PORT}`);
+  server = app.listen(currentPort, HOST, () => {
+    console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
   });
 
   const handleSignal = () => {

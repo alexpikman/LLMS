@@ -1,6 +1,6 @@
 {
   "name": "vLLM Studio — Движок высокопроизводительного инференса LLM",
-  "description": "Интерактивная студия высокопроизводительного LLM-инференса с OpenAI-совместимым API-сервером, визуализацией PagedAttention KV-кэша и планировщиком Continuous Batching.",
+  "description": "Локальный LLM Gateway с OpenAI-совместимым API, запуском GGUF-моделей, визуализацией PagedAttention KV-кэша и настраиваемым HTTP-портом (по умолчанию 3003).",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

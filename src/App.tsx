@@ -8,6 +8,7 @@ import { PagedAttentionGrid } from './components/PagedAttentionGrid';
 import { RealBenchmarkView } from './components/RealBenchmarkView';
 import { TelemetryStrip } from './components/TelemetryStrip';
 import { TopBar, type WorkspaceViewId } from './components/TopBar';
+import { ServerSettingsView } from './components/ServerSettingsView';
 import type { LocalGgufModel, ServerSnapshot } from './types/engine';
 
 export default function App() {
@@ -147,6 +148,8 @@ export default function App() {
               onGoToModels={() => setActiveView('models')}
             />
           )}
+
+          {activeView === 'settings' && <ServerSettingsView />}
 
           {activeView === 'benchmarks' && (
             <RealBenchmarkView

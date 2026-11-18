@@ -11,7 +11,13 @@ const releaseDir = path.join(rootDir, 'release-build');
 
 function run(cmd, args, opts = {}) {
   console.log(`> ${cmd} ${args.join(' ')}`);
-  execFileSync(cmd, args, { stdio: 'inherit', cwd: rootDir, ...opts });
+  execFileSync(cmd, args, {
+    stdio: 'inherit',
+    cwd: rootDir,
+    // Windows command shims (.cmd) must be launched through cmd.exe.
+    shell: process.platform === 'win32' && cmd.toLowerCase().endsWith('.cmd'),
+    ...opts,
+  });
 }
 
 async function main() {
@@ -79,7 +85,6 @@ async function main() {
   }
 
   const postjectArgs = [
-    'postject',
     targetBinPath,
     'NODE_SEA_BLOB',
     seaBlobPath,
@@ -90,7 +95,7 @@ async function main() {
     postjectArgs.push('--macho-segment-name', 'NODE_SEA');
   }
 
-  run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--yes', ...postjectArgs]);
+  run(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--yes', 'postject@1.0.0-alpha.6', ...postjectArgs]);
 
   if (process.platform === 'darwin') {
     run('codesign', ['--sign', '-', targetBinPath]);

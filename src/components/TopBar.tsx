@@ -1,5 +1,5 @@
 import React from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, Settings } from 'lucide-react';
 
 export type WorkspaceViewId =
   | 'models'
@@ -7,7 +7,8 @@ export type WorkspaceViewId =
   | 'chat'
   | 'paged_blocks'
   | 'openai_api'
-  | 'benchmarks';
+  | 'benchmarks'
+  | 'settings';
 
 interface TopBarProps {
   activeView: WorkspaceViewId;
@@ -22,6 +23,7 @@ const NAV_ITEMS: Array<{ id: WorkspaceViewId; label: string }> = [
   { id: 'paged_blocks', label: 'Блоки PagedAttention' },
   { id: 'openai_api', label: 'OpenAI API' },
   { id: 'benchmarks', label: 'Бенчмарк' },
+  { id: 'settings', label: 'Настройки' },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -51,6 +53,7 @@ export const TopBar: React.FC<TopBarProps> = ({
                 isActive ? 'text-blue-600' : 'text-slate-600 hover:text-slate-900'
               }`}
             >
+              {item.id === 'settings' ? <Settings className="inline-block w-3.5 h-3.5 mr-1.5" /> : null}
               {item.label}
               {isActive && (
                 <span

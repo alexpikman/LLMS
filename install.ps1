@@ -28,6 +28,25 @@ New-Item -ItemType Directory -Force -Path (Join-Path $DataDir "bin") | Out-Null
 $Installed = $false
 
 if ($Repo) {
+  $InstallerName = "vllm-gateway-setup-win-x64.exe"
+  $InstallerUrl = "https://github.com/$Repo/releases/latest/download/$InstallerName"
+  $TmpInstaller = Join-Path $env:TEMP $InstallerName
+  Write-Host "==> Downloading Windows installer from $InstallerUrl ..."
+  try {
+    Invoke-WebRequest -Uri $InstallerUrl -OutFile $TmpInstaller -UseBasicParsing
+    $process = Start-Process -FilePath $TmpInstaller -ArgumentList @("/DIR=`"$InstallDir`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+      throw "Windows installer exited with code $($process.ExitCode)"
+    }
+    Remove-Item $TmpInstaller -Force
+    $Installed = $true
+  } catch {
+    Write-Warning "Prebuilt Windows installer not available; trying portable ZIP."
+    if (Test-Path $TmpInstaller) { Remove-Item $TmpInstaller -Force }
+  }
+}
+
+if (-not $Installed -and $Repo) {
   $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
   $TmpZip = Join-Path $env:TEMP $AssetName
   Write-Host "==> Downloading vLLM Gateway from $DownloadUrl ..."
@@ -42,14 +61,14 @@ if ($Repo) {
 }
 
 if (-not $Installed) {
-  if ((Test-Path ".\package.json") -and (Get-Command node -ErrorAction SilentlyContinue)) {
+  if ((Test-Path ".\package.json") -and (Get-Command node -ErrorAction SilentlyContinue) -and (Get-Command bun -ErrorAction SilentlyContinue)) {
     Write-Host "==> Building standalone Windows binary locally..."
-    npm ci
-    npm run build:release
+    bun install --frozen-lockfile
+    bun run build:release
     Copy-Item -Path "release-build\*" -Destination $InstallDir -Recurse -Force
     $Installed = $true
   } else {
-    throw "Set `$env:VLLM_REPO='owner/repo' to download from GitHub Releases, or run install.ps1 inside the cloned repository with Node.js 22+."
+    throw "Set `$env:VLLM_REPO='owner/repo' to download from GitHub Releases, or run install.ps1 inside the cloned repository with Node.js 22+ and Bun."
   }
 }
 

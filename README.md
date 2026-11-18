@@ -33,6 +33,7 @@
    - Динамическая сетка физических блоков (`P0..PN`), микро-слотов внутри каждого блока (`16` или `32`), расчёт внутренней хвостовой фрагментации, повторное использование префиксных блоков (`Prefix Caching`, `refCount`) и инспекция таблицы соответствия `Logical -> Physical Block Table`.
    - Боковой виджет **GPU Context Controller** для изменения `kv_memory_utilization`, `total_blocks`, `block_size`, `max_num_seqs` и `max_model_len` на лету.
 5. **OpenAI-совместимый API и реальные бенчмарки (Recharts)**
+   - Встроенные настройки HTTP-порта с сохранением значения между запусками и автоматическим переключением сервера.
    - Поддержка SSE-стриминга и JSON-ответов для `curl`, Python (`openai`), LangChain и других клиентов.
    - Раздел бенчмарков с последовательным или конкурентным (`1 → 2 → 4`) нагрузочным тестированием и графиками пропускной способности (`tokens/sec`) и задержки (`TTFT`) на базе **Recharts**.
 
@@ -58,33 +59,33 @@ VLLM_REPO="<OWNER>/<REPO>" curl -fsSL https://raw.githubusercontent.com/<OWNER>/
 $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.ps1 | iex
 ```
 
-После установки запустите сервер:
+Для Windows 10/11 x64 также публикуется полноценный установщик:
+`vllm-gateway-setup-win-x64.exe`. Он устанавливает приложение в профиль текущего
+пользователя, создаёт ярлык и регистрирует деинсталлятор. Пользовательские модели
+хранятся отдельно в `%USERPROFILE%\.vllm-gateway` и не удаляются при деинсталляции.
 
-```bash
-vllm-gateway
-```
-
-Интерфейс и API станут доступны по адресу: **`http://localhost:3000`**
+После установки запустите vLLM Gateway из меню «Пуск» или ярлыка на рабочем столе.
+Интерфейс и OpenAI-совместимый API доступны по адресу: **`http://localhost:3003`**. Порт по умолчанию — `3003`; изменить его можно в приложении: **Настройки → HTTP-порт**. Новый порт сохраняется между перезапусками.
 
 ---
 
 ### Запуск из исходников и сборка бинарного файла
 
-Требования: **Node.js 22+**, **npm**.
+Требования: **Node.js 22+**, **Bun**.
 
 ```bash
-# 1. Установка зависимостей
-npm install
+# 1. Установка зависимостей по bun.lock
+bun install --frozen-lockfile
 
-# 2. Режим разработки (Express + Vite HMR-middleware на порту 3000)
-npm run dev
+# 2. Режим разработки (Express + Vite HMR-middleware на порту 3003)
+bun run dev
 
 # 3. Продакшен-сборка фронтенда и запуск Node-сервера
-npm run build
+bun run build
 NODE_ENV=production npm start
 
 # 4. Сборка автономного бинарника (Node.js Single Executable Application)
-npm run build:release
+bun run build:release
 # Результат находится в папке ./release-build/
 ```
 
@@ -101,7 +102,7 @@ git push origin v1.0.0
 
 | Переменная | Описание | По умолчанию |
 | :--- | :--- | :--- |
-| `PORT` | HTTP-порт сервера и OpenAI API | `3000` |
+| `PORT` | HTTP-порт сервера и OpenAI API | `3003` |
 | `VLLM_DATA_DIR` | Директория хранения `.gguf` моделей и бинарника `llama-server` | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Явный путь к исполняемому файлу `llama-server` | Автопоиск (`PATH`, `~/.vllm-gateway/bin`) |
 | `GEMINI_API_KEY` | Ключ Google Gemini API для облачных развёртываний (опционально) | — |
@@ -113,7 +114,7 @@ git push origin v1.0.0
 ### Пример использования OpenAI API
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:3003/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-3b-instruct-q4_k_m",
@@ -152,7 +153,8 @@ curl http://localhost:3000/v1/chat/completions \
 4. **Real-Time PagedAttention Grid & GPU Context Controller**
    - Visualizes physical KV-cache blocks (`P0..PN`), token micro-slots (`16` or `32`), internal tail fragmentation, shared prefix blocks (`refCount`), and per-request `Logical -> Physical` block tables.
    - Sidebar **GPU Context Controller** adjusts `kv_memory_utilization`, `total_blocks`, `block_size`, `max_num_seqs`, and `max_model_len` on the fly.
-5. **OpenAI API Console & Real Throughput Benchmarks (Recharts)**
+5. **Server Settings, OpenAI API Console & Real Throughput Benchmarks (Recharts)**
+   - Persistent HTTP port settings with live server rebinding.
    - Live SSE & JSON requests mapped directly to real token throughput (`tokens/sec`), `TTFT`, and `TPOT` charts rendered with **Recharts**.
 
 ---
@@ -183,27 +185,27 @@ Start the gateway:
 vllm-gateway
 ```
 
-Open **`http://localhost:3000`** in your browser.
+Open **`http://localhost:3003`** in your browser. The default port is `3003`; change it in the app under **Settings → HTTP Port**. The selected port persists across restarts.
 
 ---
 
 ### Build from Source & Package Standalone Binary
 
-Requirements: **Node.js 22+**, **npm**.
+Requirements: **Node.js 22+**, **Bun**.
 
 ```bash
-# Install dependencies
-npm install
+# Install dependencies from bun.lock
+bun install --frozen-lockfile
 
-# Run in development mode (Express + Vite middleware on port 3000)
-npm run dev
+# Run in development mode (Express + Vite middleware on port 3003)
+bun run dev
 
 # Production build & start
-npm run build
+bun run build
 NODE_ENV=production npm start
 
 # Build standalone Node.js SEA executable + dist/ in ./release-build/
-npm run build:release
+bun run build:release
 ```
 
 To trigger automated multi-platform GitHub Release builds (`linux-x64`, `linux-arm64`, `macos-arm64`, `win-x64`), push a version tag:
@@ -219,7 +221,7 @@ git push origin v1.0.0
 
 | Variable | Description | Default |
 | :--- | :--- | :--- |
-| `PORT` | HTTP server & OpenAI API port | `3000` |
+| `PORT` | HTTP server & OpenAI API port | `3003` |
 | `VLLM_DATA_DIR` | Storage path for `.gguf` weights and `llama-server` binaries | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Explicit path to `llama-server` binary | Auto-detected (`PATH`, `~/.vllm-gateway/bin`) |
 | `GEMINI_API_KEY` | Optional Google Gemini API key for cloud deployments | — |
@@ -233,7 +235,7 @@ git push origin v1.0.0
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:3000/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:3003/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
     model="qwen2.5-3b-instruct-q4_k_m",
