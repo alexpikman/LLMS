@@ -77,7 +77,8 @@ export async function createGatewayApp(options: {
 
   app.get('/ready', (_req, res) => {
     try {
-      fs.accessSync(PORT_CONFIG_DIR, fs.constants.W_OK);
+      const dataDir = process.env.VLLM_DATA_DIR?.trim() || PORT_CONFIG_DIR;
+      fs.accessSync(dataDir, fs.constants.W_OK);
       res.json({ ready: true, dataDirWritable: true });
     } catch {
       res.status(503).json({ ready: false, dataDirWritable: false });
