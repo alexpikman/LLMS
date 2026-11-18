@@ -61,14 +61,14 @@ if (-not $Installed -and $Repo) {
 }
 
 if (-not $Installed) {
-  if ((Test-Path ".\package.json") -and (Get-Command node -ErrorAction SilentlyContinue)) {
+  if ((Test-Path ".\package.json") -and (Get-Command node -ErrorAction SilentlyContinue) -and (Get-Command bun -ErrorAction SilentlyContinue)) {
     Write-Host "==> Building standalone Windows binary locally..."
-    npm ci
-    npm run build:release
+    bun install --frozen-lockfile
+    bun run build:release
     Copy-Item -Path "release-build\*" -Destination $InstallDir -Recurse -Force
     $Installed = $true
   } else {
-    throw "Set `$env:VLLM_REPO='owner/repo' to download from GitHub Releases, or run install.ps1 inside the cloned repository with Node.js 22+."
+    throw "Set `$env:VLLM_REPO='owner/repo' to download from GitHub Releases, or run install.ps1 inside the cloned repository with Node.js 22+ and Bun."
   }
 }
 
