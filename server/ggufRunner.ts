@@ -237,6 +237,7 @@ export async function* streamGgufChat(params: {
   topP?: number;
   stop?: string | string[];
   maxTokens?: number;
+  signal?: AbortSignal;
 }): AsyncGenerator<{
   text?: string;
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
@@ -257,7 +258,7 @@ export async function* streamGgufChat(params: {
   const res = await fetch(`http://127.0.0.1:${inst.port}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    signal: AbortSignal.timeout(120_000),
+    signal: params.signal ? AbortSignal.any([params.signal, AbortSignal.timeout(120_000)]) : AbortSignal.timeout(120_000),
     body: JSON.stringify({
       messages: payloadMessages,
       stream: true,
