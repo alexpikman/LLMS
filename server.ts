@@ -104,7 +104,10 @@ export async function createGatewayApp(options: {
     try {
       const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
       const result = authManager.setupInitialToken(requestedToken);
-      authManager.setSessionCookieHeader(res);
+      authManager.setSessionCookieHeader(
+        res,
+        req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+      );
       res.status(201).json(result);
     } catch (err) {
       res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
@@ -122,7 +125,10 @@ export async function createGatewayApp(options: {
   });
 
   app.post('/api/auth/logout', (_req, res) => {
-    authManager.clearSessionCookieHeader(res);
+    authManager.clearSessionCookieHeader(
+      res,
+      req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+    );
     res.status(204).end();
   });
 
