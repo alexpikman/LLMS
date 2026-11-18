@@ -477,6 +477,7 @@ export async function createGatewayApp(options: {
                 messages,
                 defaultSystemInstruction: deployment.systemInstruction,
                 thinkingLevel: deployment.thinkingLevel,
+                signal: streamAbortController?.signal,
               });
         const totalDurationMs = performance.now() - startedAt;
         const promptTokens = result.usage.promptTokens;
@@ -660,6 +661,7 @@ export async function createGatewayApp(options: {
                 defaultSystemInstruction: deployment.systemInstruction,
                 temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
                 maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+                signal: streamAbortController?.signal,
               })
             : streamGeminiText({
                 baseModel: textModel,
@@ -801,6 +803,7 @@ export async function createGatewayApp(options: {
         res.status(mapped.status).json({ error: { message: mapped.message, type: 'api_error' } });
       }
     } finally {
+      if (stream) res.off('close', abortOnDisconnect);
       modelServer.releaseSlot(deployment.id);
     }
   });
