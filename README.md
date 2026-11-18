@@ -242,8 +242,6 @@ git push origin v1.0.0
 ### OpenAI API Usage Example
 
 ```python
-from openai import OpenAI
-
 import os
 from openai import OpenAI
 
