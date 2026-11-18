@@ -55,7 +55,7 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
   const [deviceMode, setDeviceMode] = useState<GgufDeviceMode>('auto');
   const [gpuLayers, setGpuLayers] = useState(0);
   const [cpuThreads, setCpuThreads] = useState(Math.max(2, snapshot.hardware.cpuThreads - 1));
-  const [ctxSize, setCtxSize] = useState(snapshot.pagedAttention.maxModelLen);
+  const [ctxSize, setCtxSize] = useState(Math.max(4096, snapshot.pagedAttention.maxModelLen));
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyDeploymentId, setBusyDeploymentId] = useState<string | null>(null);
@@ -156,15 +156,38 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
 
   const handlePatch = async (
     id: string,
-    patch: Partial<Pick<ModelDeployment, 'maxConcurrentRequests' | 'enableResponseCache' | 'thinkingLevel'>>
+    patch: Partial<Pick<ModelDeployment, 'maxConcurrentRequests' | 'enableResponseCache' | 'thinkingLevel' | 'ctxSize'>>
   ) => {
-    const res = await fetch(`/api/deployments/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch),
-    });
-    const json = await res.json();
-    if (res.ok) onRefreshSnapshot(json.snapshot);
+    try {
+      const deployment = snapshot.deployments.find((item) => item.id === id);
+      const mustRestart = typeof patch.ctxSize === 'number' && deployment?.provider === 'local_gguf';
+      const wasRunning = deployment?.status === 'running';
+
+      if (mustRestart && wasRunning) {
+        const stopResponse = await fetch(`/api/deployments/${id}/stop`, { method: 'POST' });
+        const stopData = await stopResponse.json();
+        if (!stopResponse.ok) throw new Error(stopData.error || 'Не удалось остановить модель');
+      }
+
+      const response = await fetch(`/api/deployments/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(patch),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Не удалось сохранить настройки модели');
+
+      if (mustRestart && wasRunning) {
+        const startResponse = await fetch(`/api/deployments/${id}/start`, { method: 'POST' });
+        const startData = await startResponse.json();
+        if (!startResponse.ok) throw new Error(startData.error || 'Не удалось перезапустить модель');
+        onRefreshSnapshot(startData.snapshot);
+      } else {
+        onRefreshSnapshot(data.snapshot);
+      }
+    } catch (err) {
+      setActionError(err instanceof Error ? err.message : 'Не удалось изменить настройки модели');
+    }
   };
 
   const handleDelete = async (id: string) => {
@@ -613,6 +636,25 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
                     ))}
                   </select>
                 </label>
+
+                {dep.provider === 'local_gguf' && (
+                  <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded px-2.5 py-1.5 cursor-pointer">
+                    <span>Контекст:</span>
+                    <select
+                      aria-label={`Размер контекста для ${dep.alias}`}
+                      value={dep.ctxSize ?? 2048}
+                      disabled={isBusy}
+                      onChange={(e) => handlePatch(dep.id, { ctxSize: Number(e.target.value) })}
+                      className="bg-transparent font-mono text-slate-900 dark:text-slate-100 focus:outline-none disabled:opacity-50"
+                    >
+                      {[1024, 2048, 4096, 8192, 16384].map((size) => (
+                        <option key={size} value={size}>
+                          {size.toLocaleString('ru-RU')}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
 
                 {dep.capability === 'text' && (
                   <label className="inline-flex items-center gap-1.5 text-xs text-slate-700 bg-slate-50 border border-slate-200 rounded px-2.5 py-1.5 cursor-pointer">
