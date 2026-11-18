@@ -647,7 +647,7 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
                       onChange={(e) => handlePatch(dep.id, { ctxSize: Number(e.target.value) })}
                       className="bg-transparent font-mono text-slate-900 dark:text-slate-100 focus:outline-none disabled:opacity-50"
                     >
-                      {[1024, 2048, 4096, 8192, 16384].map((size) => (
+                      {[512, 1024, 2048, 4096, 8192, 16384].map((size) => (
                         <option key={size} value={size}>
                           {size.toLocaleString('ru-RU')}
                         </option>
