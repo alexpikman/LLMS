@@ -62,7 +62,7 @@ jobs:
             for ($attempt = 0; $attempt -lt 30; $attempt++) {
               Start-Sleep -Seconds 1
               try {
-                $response = Invoke-WebRequest -Uri "http://127.0.0.1:3000/" -UseBasicParsing -TimeoutSec 2
+                $response = Invoke-WebRequest -Uri "http://127.0.0.1:3003/" -UseBasicParsing -TimeoutSec 2
                 if ($response.StatusCode -eq 200) {
                   $ready = $true
                   break
@@ -70,7 +70,7 @@ jobs:
               } catch {}
             }
             if (-not $ready) {
-              throw "Standalone executable did not serve the UI on http://127.0.0.1:3000"
+              throw "Standalone executable did not serve the UI on http://127.0.0.1:3003"
             }
           } finally {
             if (-not $process.HasExited) {
