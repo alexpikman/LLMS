@@ -1209,6 +1209,7 @@ async function startServer() {
     const activeServer = app.locals.server as ReturnType<typeof app.listen>;
     engine.shutdown();
     activeServer.close(() => process.exit(0));
+    activeServer.closeAllConnections?.();
   };
   process.once('SIGINT', handleSignal);
   process.once('SIGTERM', handleSignal);
