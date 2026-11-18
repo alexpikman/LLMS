@@ -85,7 +85,6 @@ async function main() {
   }
 
   const postjectArgs = [
-    'postject',
     targetBinPath,
     'NODE_SEA_BLOB',
     seaBlobPath,
