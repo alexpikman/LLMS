@@ -221,7 +221,11 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
     if (idx <= 0) continue;
     const key = part.slice(0, idx).trim();
     const val = part.slice(idx + 1).trim();
-    map[key] = decodeURIComponent(val);
+    try {
+      map[key] = decodeURIComponent(val);
+    } catch {
+      // Ignore malformed cookie values instead of failing the whole request.
+    }
   }
   return map;
 }
@@ -414,7 +418,31 @@ export function openAiError(
 
 export function createAuthMiddleware(authManager: AuthManager) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (authManager.isRequestAuthenticated(req)) {
+    const bearer = authManager.extractBearerOrApiKey(req);
+    const bearerAuthenticated = Boolean(bearer && authManager.verifyToken(bearer));
+    const cookieAuthenticated = !bearerAuthenticated && authManager.verifySessionCookie(req.headers.cookie);
+
+    if (bearerAuthenticated || cookieAuthenticated) {
+      if (
+        cookieAuthenticated &&
+        !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
+      ) {
+        const origin = req.headers.origin;
+        const host = req.headers.host;
+        if (!origin || !host) {
+          res.status(403).json(openAiError('Для cookie-сессии требуется same-origin запрос.', 'forbidden', null, 'csrf_check_failed'));
+          return;
+        }
+        try {
+          if (new URL(origin).host !== host) {
+            res.status(403).json(openAiError('Cross-origin запросы с cookie-сессией запрещены.', 'forbidden', null, 'csrf_check_failed'));
+            return;
+          }
+        } catch {
+          res.status(403).json(openAiError('Некорректный заголовок Origin.', 'forbidden', null, 'csrf_check_failed'));
+          return;
+        }
+      }
       next();
       return;
     }
