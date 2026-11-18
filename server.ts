@@ -116,7 +116,22 @@ export async function createGatewayApp(options: {
     res.status(204).end();
   });
 
-  app.use(['/api', '/v1'], createAuthMiddleware(authManager));
+  app.use(
+    ['/api', '/v1'],
+    createRateLimiter({ windowMs: 60_000, maxRequests: 180 }),
+    createAuthMiddleware(authManager)
+  );
+
+  app.post('/api/auth/rotate', (req, res) => {
+    try {
+      const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
+      const result = authManager.rotateToken(requestedToken);
+      authManager.setSessionCookieHeader(res);
+      res.json(result);
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   app.get('/api/server/config', (_req, res) => {
     res.json({ host: HOST, port: currentPort, defaultPort: DEFAULT_PORT });
