@@ -58,12 +58,12 @@ VLLM_REPO="<OWNER>/<REPO>" curl -fsSL https://raw.githubusercontent.com/<OWNER>/
 $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.ps1 | iex
 ```
 
-После установки запустите сервер:
+Для Windows 10/11 x64 также публикуется полноценный установщик:
+`vllm-gateway-setup-win-x64.exe`. Он устанавливает приложение в профиль текущего
+пользователя, создаёт ярлык и регистрирует деинсталлятор. Пользовательские модели
+хранятся отдельно в `%USERPROFILE%\.vllm-gateway` и не удаляются при деинсталляции.
 
-```bash
-vllm-gateway
-```
-
+После установки запустите vLLM Gateway из меню «Пуск» или ярлыка на рабочем столе.
 Интерфейс и API станут доступны по адресу: **`http://localhost:3000`**
 
 ---
