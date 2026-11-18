@@ -82,20 +82,17 @@ if (-not $Installed -and $Repo) {
   Write-Host "==> Downloading vLLM Gateway from $DownloadUrl ..."
   try {
     Invoke-WebRequest -Uri $DownloadUrl -OutFile $TmpZip -UseBasicParsing
-    try {
-      Invoke-WebRequest -Uri $SumsUrl -OutFile $TmpSums -UseBasicParsing
-      $ExpectedLine = Get-Content $TmpSums | Where-Object { $_ -match "\s+$AssetName$" } | Select-Object -First 1
-      if ($ExpectedLine) {
-        $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
-        $ActualHash = (Get-FileHash -Path $TmpZip -Algorithm SHA256).Hash.ToUpperInvariant()
-        if ($ActualHash -ne $ExpectedHash) {
-          throw "SHA-256 checksum mismatch for $AssetName!"
-        }
-        Write-Host "==> SHA-256 checksum verified."
-      }
-    } catch {
-      if ($_.Exception.Message -like "*checksum mismatch*") { throw }
+    Invoke-WebRequest -Uri $SumsUrl -OutFile $TmpSums -UseBasicParsing
+    $ExpectedLine = Get-Content $TmpSums | Where-Object { $_ -match "\s+$AssetName$" } | Select-Object -First 1
+    if (-not $ExpectedLine) {
+      throw "SHA-256 checksum entry missing for $AssetName."
     }
+    $ExpectedHash = ($ExpectedLine -split "\s+")[0].ToUpperInvariant()
+    $ActualHash = (Get-FileHash -Path $TmpZip -Algorithm SHA256).Hash.ToUpperInvariant()
+    if ($ActualHash -ne $ExpectedHash) {
+      throw "SHA-256 checksum mismatch for $AssetName!"
+    }
+    Write-Host "==> SHA-256 checksum verified."
     Expand-Archive -Path $TmpZip -DestinationPath $InstallDir -Force
     Remove-Item $TmpZip -Force -ErrorAction SilentlyContinue
     Remove-Item $TmpSums -Force -ErrorAction SilentlyContinue
@@ -164,4 +161,4 @@ Write-Host "  Models dir: $(Join-Path $DataDir 'models')"
 Write-Host "  Archives:   $(Join-Path $DataDir 'archives')"
 Write-Host ""
 Write-Host "Run in a new terminal: vllm-gateway.exe"
-Write-Host "Then open http://localhost:3000"
+Write-Host "Then open http://localhost:3003"

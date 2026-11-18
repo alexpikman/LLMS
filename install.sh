@@ -96,23 +96,32 @@ if [[ -n "$REPO" ]]; then
   TMP_DIR="$(mktemp -d)"
   TMP_ARCHIVE="$TMP_DIR/$ASSET_NAME"
   if curl -fsSL "$DOWNLOAD_URL" -o "$TMP_ARCHIVE"; then
-    if curl -fsSL "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS.txt"; then
-      EXPECTED=$(grep " ${ASSET_NAME}\$" "$TMP_DIR/SHA256SUMS.txt" | awk '{print $1}' || true)
-      if [[ -n "$EXPECTED" ]]; then
-        ACTUAL=""
-        if command -v sha256sum >/dev/null 2>&1; then
-          ACTUAL=$(sha256sum "$TMP_ARCHIVE" | awk '{print $1}')
-        elif command -v shasum >/dev/null 2>&1; then
-          ACTUAL=$(shasum -a 256 "$TMP_ARCHIVE" | awk '{print $1}')
-        fi
-        if [[ -n "$ACTUAL" && "$ACTUAL" != "$EXPECTED" ]]; then
-          echo "Error: SHA-256 checksum mismatch for $ASSET_NAME!"
-          rm -rf "$TMP_DIR"
-          exit 1
-        fi
-        echo "==> SHA-256 checksum verified."
-      fi
+    if ! curl -fsSL "$SUMS_URL" -o "$TMP_DIR/SHA256SUMS.txt"; then
+      echo "Error: SHA-256 checksum manifest is unavailable."
+      rm -rf "$TMP_DIR"
+      exit 1
     fi
+    EXPECTED=$(grep " ${ASSET_NAME}\\$" "$TMP_DIR/SHA256SUMS.txt" | awk '{print $1}' || true)
+    if [[ -z "$EXPECTED" ]]; then
+      echo "Error: SHA-256 checksum entry missing for $ASSET_NAME."
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+      ACTUAL=$(sha256sum "$TMP_ARCHIVE" | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+      ACTUAL=$(shasum -a 256 "$TMP_ARCHIVE" | awk '{print $1}')
+    else
+      echo "Error: no SHA-256 utility is available."
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+    if [[ "$ACTUAL" != "$EXPECTED" ]]; then
+      echo "Error: SHA-256 checksum mismatch for $ASSET_NAME!"
+      rm -rf "$TMP_DIR"
+      exit 1
+    fi
+    echo "==> SHA-256 checksum verified."
     rm -rf "$INSTALL_DIR"/*
     tar -xzf "$TMP_ARCHIVE" -C "$INSTALL_DIR"
     chmod +x "$INSTALL_DIR/vllm-gateway"
@@ -174,4 +183,4 @@ if [[ ":$PATH:" != *":$BIN_LINK_DIR:"* ]]; then
 fi
 echo "Start the server with:"
 echo "  vllm-gateway"
-echo "Then open http://localhost:3000 in your browser (or set VLLM_API_KEY env var)."
+echo "Then open http://localhost:3003 in your browser (or set VLLM_API_KEY env var)."
