@@ -65,7 +65,7 @@ $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<
 хранятся отдельно в `%USERPROFILE%\.vllm-gateway` и не удаляются при деинсталляции.
 
 После установки запустите vLLM Gateway из меню «Пуск» или ярлыка на рабочем столе.
-При первом открытии веб-интерфейс предложит создать API-токен. Сохраните его: он показывается один раз. Для OpenAI-совместимого API передавайте `Authorization: Bearer <TOKEN>`. Для автоматизированного развёртывания можно заранее задать `VLLM_API_KEY`.
+При первом открытии на localhost веб-интерфейс предложит создать API-токен. Сохраните его: он показывается один раз. Первичная настройка заблокирована для удалённых клиентов; на удалённом сервере задайте `VLLM_API_KEY` до запуска. Для OpenAI-совместимого API передавайте `Authorization: Bearer <TOKEN>`. Для автоматизированного развёртывания можно заранее задать `VLLM_API_KEY`.
 Интерфейс и OpenAI-совместимый API доступны по адресу: **`http://localhost:3003`**. Порт по умолчанию — `3003`; изменить его можно в приложении: **Настройки → HTTP-порт**. Новый порт сохраняется между перезапусками.
 
 ---
@@ -183,7 +183,7 @@ Or from a cloned repository:
 $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.ps1 | iex
 ```
 
-On first launch, the web UI asks you to initialize an API token. Save it immediately; it is shown only once. Send it as `Authorization: Bearer <TOKEN>` to the OpenAI-compatible API. For unattended deployments, set `VLLM_API_KEY` before starting the server.
+On first launch from localhost, the web UI asks you to initialize an API token. Save it immediately; it is shown only once. Remote first-run setup is blocked; set `VLLM_API_KEY` before starting a remote server. Send the token as `Authorization: Bearer <TOKEN>` to the OpenAI-compatible API. For unattended deployments, set `VLLM_API_KEY` before starting the server.
 
 Start the gateway:
 
