@@ -42,6 +42,7 @@ export interface GeminiTextRequest {
   topP?: number;
   maxTokens?: number;
   stop?: string | string[];
+  signal?: AbortSignal;
 }
 
 export interface GeminiUsage {
@@ -155,8 +156,15 @@ export async function* streamGeminiText(
     },
   });
 
-  for await (const chunk of responseStream) {
-    const text = chunk.text ?? '';
+  const iterator = responseStream[Symbol.asyncIterator]();
+  const cancelStream = () => { void iterator.return?.(); };
+  req.signal?.addEventListener('abort', cancelStream, { once: true });
+  try {
+    while (!req.signal?.aborted) {
+      const next = await iterator.next();
+      if (next.done) break;
+      const chunk = next.value;
+      const text = chunk.text ?? '';
     const meta = chunk.usageMetadata;
     const usage =
       meta && (meta.promptTokenCount || meta.candidatesTokenCount || meta.totalTokenCount)
@@ -167,9 +175,13 @@ export async function* streamGeminiText(
           }
         : undefined;
 
-    if (text || usage) {
-      yield { text, usage };
+      if (text || usage) {
+        yield { text, usage };
+      }
     }
+  } finally {
+    req.signal?.removeEventListener('abort', cancelStream);
+    if (req.signal?.aborted) await iterator.return?.();
   }
 }
 
