@@ -41,6 +41,12 @@ export function isPrivateOrReservedIp(rawIp: string): boolean {
     if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & cloud metadata
     if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
     if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 192 && b === 0 && octets[2] === 0) return true; // 192.0.0.0/24 protocol assignments
+    if (a === 192 && b === 0 && octets[2] === 2) return true; // 192.0.2.0/24 documentation
+    if (a === 192 && b === 88 && octets[2] === 99) return true; // 192.88.99.0/24 deprecated 6to4 relay
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+    if (a === 198 && b === 51 && octets[2] === 100) return true; // 198.51.100.0/24 documentation
+    if (a === 203 && b === 0 && octets[2] === 113) return true; // 203.0.113.0/24 documentation
     if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
     if (a >= 224) return true; // multicast / reserved
     return false;
@@ -52,6 +58,9 @@ export function isPrivateOrReservedIp(rawIp: string): boolean {
   if (lower.startsWith('fe80:')) return true; // link-local
   if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // ULA fc00::/7
   if (lower.startsWith('ff')) return true; // multicast
+  if (lower.startsWith('2001:db8:') || lower.startsWith('2001:0:') || lower.startsWith('2002:')) return true;
+  const firstHextet = Number.parseInt(lower.split(':')[0] || '0', 16);
+  if ((firstHextet & 0xe000) !== 0x2000) return true; // Only global unicast 2000::/3 is routable
   return false;
 }
 
