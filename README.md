@@ -244,7 +244,10 @@ git push origin v1.0.0
 ```python
 from openai import OpenAI
 
-import os\n\nclient = OpenAI(base_url="http://localhost:3003/v1", api_key=os.environ["VLLM_API_KEY"])
+import os
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:3003/v1", api_key=os.environ["VLLM_API_KEY"])
 
 response = client.chat.completions.create(
     model="qwen2.5-3b-instruct-q4_k_m",
