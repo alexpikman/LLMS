@@ -169,6 +169,22 @@ jobs:
             throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
           }
 
+      - name: Smoke-test Windows installer install and uninstall
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'vllm-gateway-installer-test'
+          $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"")
+          $install = Start-Process -FilePath ".\vllm-gateway-setup-win-x64.exe" -ArgumentList $installArgs -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Windows installer exited with code $($install.ExitCode)" }
+          $installedExe = Join-Path $installDir 'vllm-gateway.exe'
+          if (-not (Test-Path $installedExe)) { throw "Installed executable not found: $installedExe" }
+          $uninstaller = Join-Path $installDir 'unins000.exe'
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller not found: $uninstaller" }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Windows uninstaller exited with code $($uninstall.ExitCode)" }
+          if (Test-Path $installedExe) { throw "Uninstall left the gateway executable behind" }
+
       - name: Sign Windows installer
         if: matrix.target == 'win-x64'
         shell: pwsh
