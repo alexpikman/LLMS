@@ -224,7 +224,7 @@ export async function createGatewayApp(options: {
       res.status(400).json({ error: { message: 'temperature должен быть числом от 0 до 2.', type: 'invalid_request_error' } });
       return;
     }
-    if (body.top_p !== undefined && (typeof body.top_p !== 'number' || body.top_p <= 0 || body.top_p > 1)) {
+    if (body.top_p !== undefined && (typeof body.top_p !== 'number' || body.top_p < 0 || body.top_p > 1)) {
       res.status(400).json({ error: { message: 'top_p должен быть числом больше 0 и не больше 1.', type: 'invalid_request_error' } });
       return;
     }
