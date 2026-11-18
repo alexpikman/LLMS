@@ -181,7 +181,7 @@ export async function* streamGeminiText(
     }
   } finally {
     req.signal?.removeEventListener('abort', cancelStream);
-    if (req.signal?.aborted) await iterator.return?.();
+    if (req.signal?.aborted) await iterator.return?.(undefined);
   }
 }
 
