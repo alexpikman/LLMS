@@ -64,6 +64,13 @@ export interface GpuDeviceInfo {
   driverVersion: string | null;
 }
 
+export interface LlamaArchiveInfo {
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  location: 'vendor' | 'data';
+}
+
 export interface HardwareProfile {
   hostname: string;
   osPlatform: string;
@@ -82,9 +89,12 @@ export interface HardwareProfile {
   diskTotalBytes: number;
   modelsDir: string;
   binDir: string;
+  archivesDir: string;
+  vendorArchivesDir: string;
   llamaServerPath: string | null;
   llamaServerAvailable: boolean;
   llamaServerVersion: string | null;
+  localArchives: LlamaArchiveInfo[];
   detectedAtMs: number;
 }
 
@@ -220,7 +230,16 @@ export interface PagedBlockEntry {
   isSharedPrefix: boolean;
 }
 
+export interface LlamaSlotInfo {
+  deploymentAlias: string;
+  slotId: number;
+  isProcessing: boolean;
+  nCtx: number;
+}
+
 export interface PagedAttentionSnapshot {
+  telemetryMode: 'logical_model' | 'hybrid_llama_slots';
+  llamaSlots: LlamaSlotInfo[];
   blockSize: 16 | 32;
   totalBlocks: number;
   usableBlocks: number;
@@ -238,6 +257,14 @@ export interface PagedAttentionSnapshot {
   naiveReservedSlots: number;
   naiveFragmentationPct: number;
   blocks: PagedBlock[];
+}
+
+export interface AuthStatusSnapshot {
+  authEnabled: boolean;
+  setupRequired: boolean;
+  authenticated: boolean;
+  managedByEnv: boolean;
+  tokenPrefix: string | null;
 }
 
 export interface RequestRecord {

@@ -7,6 +7,7 @@ import {
   type BaseModelId,
   type GgufDeviceMode,
   type HardwareProfile,
+  type LlamaSlotInfo,
   type LocalGgufModel,
   type ModelDeployment,
   type PagedAttentionSnapshot,
@@ -15,10 +16,18 @@ import {
   type ServerSnapshot,
   type ThinkingLevelOption,
 } from '../src/types/engine.ts';
+import { loadOrInitConfig, saveConfigAtomic } from './config.ts';
 import { downloadManager } from './downloader.ts';
 import { isGeminiApiKeyConfigured, probeModelReadiness } from './gemini.ts';
-import { startGgufProcess, stopAllGgufProcesses, stopGgufProcess } from './ggufRunner.ts';
+import {
+  queryLlamaSlots,
+  startGgufProcess,
+  stopAllGgufProcesses,
+  stopGgufProcess,
+} from './ggufRunner.ts';
 import { assessModelCompatibility, detectHardwareProfile } from './hardware.ts';
+import { logger } from './logger.ts';
+import { validateAlias } from './security.ts';
 
 type Listener = (snapshot: ServerSnapshot) => void;
 
@@ -90,21 +99,130 @@ export class ModelServerRuntime {
     diskTotalBytes: 0,
     modelsDir: '',
     binDir: '',
+    archivesDir: '',
+    vendorArchivesDir: '',
     llamaServerPath: null,
     llamaServerAvailable: false,
     llamaServerVersion: null,
+    localArchives: [],
     detectedAtMs: Date.now(),
   };
   private localModelsCache: LocalGgufModel[] = [];
+  private llamaSlotsCache: LlamaSlotInfo[] = [];
+  private crashRestartCounts = new Map<string, number>();
+  private slotPollTimer: NodeJS.Timeout | null = null;
+  private dataDir: string | undefined;
 
-  constructor() {
+  constructor(options?: { skipBackgroundInit?: boolean; dataDir?: string }) {
+    this.dataDir = options?.dataDir;
+    this.loadPersistedPagedConfig();
     this.seedInitialDeployments();
     this.initPagedPool();
     downloadManager.subscribe(() => {
       void this.refreshLocalModels();
       this.broadcast();
     });
-    void this.refreshHardwareAndModels(true);
+    if (!options?.skipBackgroundInit) {
+      void this.refreshHardwareAndModels(true);
+      this.slotPollTimer = setInterval(() => {
+        void this.pollRunningLlamaSlots();
+      }, 2500);
+      this.slotPollTimer.unref();
+    }
+  }
+
+  private loadPersistedPagedConfig(): void {
+    try {
+      const cfg = loadOrInitConfig(this.dataDir);
+      this.pagedBlockSize = cfg.pagedAttention.blockSize;
+      this.pagedTotalBlocks = cfg.pagedAttention.totalBlocks;
+      this.kvMemoryUtilization = cfg.pagedAttention.kvMemoryUtilization;
+      this.maxNumSeqs = cfg.pagedAttention.maxNumSeqs;
+      this.maxModelLen = cfg.pagedAttention.maxModelLen;
+      this.enablePrefixCaching = cfg.pagedAttention.enablePrefixCaching;
+    } catch {
+      // Keep safe defaults
+    }
+  }
+
+  private persistPagedConfig(): void {
+    try {
+      const cfg = loadOrInitConfig(this.dataDir);
+      cfg.pagedAttention = {
+        blockSize: this.pagedBlockSize,
+        totalBlocks: this.pagedTotalBlocks,
+        kvMemoryUtilization: this.kvMemoryUtilization,
+        maxNumSeqs: this.maxNumSeqs,
+        maxModelLen: this.maxModelLen,
+        enablePrefixCaching: this.enablePrefixCaching,
+      };
+      saveConfigAtomic(cfg, this.dataDir);
+    } catch (err) {
+      logger.warn('config', 'Не удалось сохранить конфигурацию PagedAttention', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  private async pollRunningLlamaSlots(): Promise<void> {
+    const ggufDeps = Array.from(this.deployments.values()).filter(
+      (d) => d.provider === 'local_gguf' && d.status === 'running'
+    );
+    if (ggufDeps.length === 0) {
+      if (this.llamaSlotsCache.length > 0) {
+        this.llamaSlotsCache = [];
+        this.broadcast();
+      }
+      return;
+    }
+
+    const nextSlots: LlamaSlotInfo[] = [];
+    for (const dep of ggufDeps) {
+      const raw = await queryLlamaSlots(dep.id);
+      for (const s of raw) {
+        nextSlots.push({
+          deploymentAlias: dep.alias,
+          slotId: s.id,
+          isProcessing: Boolean(s.is_processing),
+          nCtx: Number(s.n_ctx ?? dep.ctxSize ?? this.maxModelLen),
+        });
+      }
+    }
+    this.llamaSlotsCache = nextSlots;
+    this.broadcast();
+  }
+
+  private handleGgufUnexpectedExit(
+    deploymentId: string,
+    code: number | null,
+    signal: NodeJS.Signals | null,
+    stderrTail: string
+  ): void {
+    const dep = this.deployments.get(deploymentId);
+    if (!dep || dep.status !== 'running') return;
+
+    const attempts = (this.crashRestartCounts.get(deploymentId) ?? 0) + 1;
+    this.crashRestartCounts.set(deploymentId, attempts);
+    dep.localPort = null;
+    dep.pid = null;
+
+    if (attempts <= 3) {
+      dep.status = 'starting';
+      dep.lastError = `Аварийный выход процесса (код ${code ?? signal}). Автовосстановление (${attempts}/3)...`;
+      this.broadcast();
+      const delayMs = attempts * 1000;
+      setTimeout(() => {
+        const latest = this.deployments.get(deploymentId);
+        if (latest && latest.status === 'starting') {
+          void this.startDeployment(deploymentId, true);
+        }
+      }, delayMs);
+    } else {
+      dep.status = 'error';
+      dep.startedAtMs = null;
+      dep.lastError = `Процесс llama-server завершился с кодом ${code ?? signal} после 3 попыток. ${stderrTail.slice(-200)}`;
+      this.broadcast();
+    }
   }
 
   public async refreshHardwareAndModels(forceHardware = false): Promise<ServerSnapshot> {
@@ -120,6 +238,10 @@ export class ModelServerRuntime {
   }
 
   public shutdown(): void {
+    if (this.slotPollTimer) {
+      clearInterval(this.slotPollTimer);
+      this.slotPollTimer = null;
+    }
     stopAllGgufProcesses();
   }
 
@@ -269,6 +391,7 @@ export class ModelServerRuntime {
       }
     }
 
+    this.persistPagedConfig();
     this.broadcast();
     return this.getSnapshot();
   }
@@ -464,10 +587,7 @@ export class ModelServerRuntime {
     cpuThreads?: number;
     ctxSize?: number;
   }): Promise<ModelDeployment> {
-    const cleanAlias = input.alias.trim();
-    if (!cleanAlias) {
-      throw new Error('Укажите имя (alias) запускаемой модели.');
-    }
+    const cleanAlias = validateAlias(input.alias);
     const existing = Array.from(this.deployments.values()).find((d) => d.alias === cleanAlias);
     if (existing) {
       throw new Error(`Модель с именем "${cleanAlias}" уже существует.`);
@@ -550,7 +670,11 @@ export class ModelServerRuntime {
           cpuThreads: deployment.cpuThreads ?? 4,
           ctxSize: deployment.ctxSize ?? this.maxModelLen,
           parallelSlots: deployment.maxConcurrentRequests,
+          onUnexpectedExit: (code, signal, stderrTail) => {
+            this.handleGgufUnexpectedExit(id, code, signal, stderrTail);
+          },
         });
+        this.crashRestartCounts.set(id, 0);
         deployment.status = 'running';
         deployment.startedAtMs = Date.now();
         deployment.localPort = proc.port;
@@ -599,7 +723,11 @@ export class ModelServerRuntime {
           cpuThreads: dep.cpuThreads ?? 4,
           ctxSize: dep.ctxSize ?? this.maxModelLen,
           parallelSlots: dep.maxConcurrentRequests,
+          onUnexpectedExit: (code, signal, stderrTail) => {
+            this.handleGgufUnexpectedExit(dep.id, code, signal, stderrTail);
+          },
         });
+        this.crashRestartCounts.set(dep.id, 0);
         dep.status = 'running';
         dep.startedAtMs = Date.now();
         dep.localPort = proc.port;
@@ -1018,6 +1146,8 @@ export class ModelServerRuntime {
         : 0;
 
     return {
+      telemetryMode: this.llamaSlotsCache.length > 0 ? 'hybrid_llama_slots' : 'logical_model',
+      llamaSlots: this.llamaSlotsCache.map((s) => ({ ...s })),
       blockSize: this.pagedBlockSize,
       totalBlocks: this.pagedTotalBlocks,
       usableBlocks,
@@ -1112,4 +1242,6 @@ export class ModelServerRuntime {
   }
 }
 
-export const modelServer = new ModelServerRuntime();
+export const modelServer = new ModelServerRuntime({
+  skipBackgroundInit: process.env.VLLM_NO_LISTEN === '1' || process.env.NODE_ENV === 'test',
+});

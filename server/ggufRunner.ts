@@ -3,8 +3,9 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import type { GgufDeviceMode } from '../src/types/engine.ts';
-import { detectHardwareProfile } from './hardware.ts';
 import type { OpenAiChatMessage } from './gemini.ts';
+import { detectHardwareProfile } from './hardware.ts';
+import { logger } from './logger.ts';
 
 interface ManagedLlamaInstance {
   deploymentId: string;
@@ -12,6 +13,13 @@ interface ManagedLlamaInstance {
   pid: number;
   process: ChildProcess;
   stderrTail: string;
+  stoppingIntentional: boolean;
+}
+
+export interface RawLlamaSlot {
+  id: number;
+  is_processing?: boolean;
+  n_ctx?: number;
 }
 
 const runningProcesses = new Map<string, ManagedLlamaInstance>();
@@ -31,7 +39,11 @@ async function findFreePort(startPort = 18080): Promise<number> {
   });
 }
 
-async function waitForHealth(port: number, proc: ChildProcess, getStderr: () => string): Promise<void> {
+async function waitForHealth(
+  port: number,
+  proc: ChildProcess,
+  getStderr: () => string
+): Promise<void> {
   const deadline = Date.now() + 60_000;
   while (Date.now() < deadline) {
     if (proc.exitCode !== null) {
@@ -40,15 +52,14 @@ async function waitForHealth(port: number, proc: ChildProcess, getStderr: () => 
       );
     }
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(2000),
+      });
       if (res.ok) {
         return;
       }
-      if (res.status === 503) {
-        // Still loading model weights into VRAM/RAM
-      }
     } catch {
-      // Server socket not bound yet
+      // Server socket not ready yet
     }
     await new Promise((r) => setTimeout(r, 400));
   }
@@ -63,6 +74,7 @@ export async function startGgufProcess(params: {
   cpuThreads: number;
   ctxSize: number;
   parallelSlots: number;
+  onUnexpectedExit?: (code: number | null, signal: NodeJS.Signals | null, stderrTail: string) => void;
 }): Promise<{ port: number; pid: number }> {
   await stopGgufProcess(params.deploymentId);
 
@@ -73,7 +85,7 @@ export async function startGgufProcess(params: {
   const hw = await detectHardwareProfile(true);
   if (!hw.llamaServerPath) {
     throw new Error(
-      `Бинарник llama-server не найден на этом ПК. Нажмите «Установить llama-server» в разделе «Центр GGUF» или задайте переменную LLAMA_SERVER_PATH.`
+      `Бинарник llama-server не найден на этом ПК. Установите его из GitHub или локального архива в разделе «Центр GGUF».`
     );
   }
 
@@ -125,6 +137,7 @@ export async function startGgufProcess(params: {
     pid: child.pid ?? 0,
     process: child,
     stderrTail: '',
+    stoppingIntentional: false,
   };
 
   child.stderr?.on('data', (chunk: Buffer) => {
@@ -134,10 +147,31 @@ export async function startGgufProcess(params: {
     instance.stderrTail = (instance.stderrTail + chunk.toString('utf8')).slice(-2000);
   });
 
+  let startedSuccessfully = false;
+  child.on('exit', (code, signal) => {
+    if (runningProcesses.get(params.deploymentId) === instance) {
+      runningProcesses.delete(params.deploymentId);
+    }
+    if (startedSuccessfully && !instance.stoppingIntentional) {
+      logger.error('ggufRunner', 'Неожиданное завершение процесса llama-server', {
+        deploymentId: params.deploymentId,
+        code,
+        signal,
+      });
+      params.onUnexpectedExit?.(code, signal, instance.stderrTail);
+    }
+  });
+
   runningProcesses.set(params.deploymentId, instance);
 
   try {
     await waitForHealth(port, child, () => instance.stderrTail);
+    startedSuccessfully = true;
+    logger.info('ggufRunner', 'Процесс llama-server запущен', {
+      deploymentId: params.deploymentId,
+      port,
+      pid: instance.pid,
+    });
     return { port, pid: instance.pid };
   } catch (err) {
     await stopGgufProcess(params.deploymentId);
@@ -148,11 +182,12 @@ export async function startGgufProcess(params: {
 export async function stopGgufProcess(deploymentId: string): Promise<void> {
   const inst = runningProcesses.get(deploymentId);
   if (!inst) return;
+  inst.stoppingIntentional = true;
   runningProcesses.delete(deploymentId);
   try {
     if (inst.process.exitCode === null) {
       inst.process.kill('SIGTERM');
-      await new Promise((r) => setTimeout(r, 250));
+      await new Promise((r) => setTimeout(r, 350));
       if (inst.process.exitCode === null) {
         inst.process.kill('SIGKILL');
       }
@@ -165,14 +200,32 @@ export async function stopGgufProcess(deploymentId: string): Promise<void> {
 export function stopAllGgufProcesses(): void {
   for (const id of Array.from(runningProcesses.keys())) {
     const inst = runningProcesses.get(id);
-    if (inst && inst.process.exitCode === null) {
-      try {
-        inst.process.kill('SIGTERM');
-      } catch {
-        // Ignore cleanup error
+    if (inst) {
+      inst.stoppingIntentional = true;
+      if (inst.process.exitCode === null) {
+        try {
+          inst.process.kill('SIGTERM');
+        } catch {
+          // Ignore cleanup error
+        }
       }
     }
     runningProcesses.delete(id);
+  }
+}
+
+export async function queryLlamaSlots(deploymentId: string): Promise<RawLlamaSlot[]> {
+  const inst = runningProcesses.get(deploymentId);
+  if (!inst || inst.process.exitCode !== null) return [];
+  try {
+    const res = await fetch(`http://127.0.0.1:${inst.port}/slots`, {
+      signal: AbortSignal.timeout(1200),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as unknown;
+    return Array.isArray(data) ? (data as RawLlamaSlot[]) : [];
+  } catch {
+    return [];
   }
 }
 
@@ -181,6 +234,8 @@ export async function* streamGgufChat(params: {
   messages: OpenAiChatMessage[];
   defaultSystemInstruction?: string;
   temperature?: number;
+  topP?: number;
+  stop?: string | string[];
   maxTokens?: number;
 }): AsyncGenerator<{
   text?: string;
@@ -202,11 +257,14 @@ export async function* streamGgufChat(params: {
   const res = await fetch(`http://127.0.0.1:${inst.port}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(120_000),
     body: JSON.stringify({
       messages: payloadMessages,
       stream: true,
       stream_options: { include_usage: true },
       temperature: params.temperature ?? 0.7,
+      top_p: params.topP,
+      stop: params.stop,
       max_tokens: params.maxTokens,
     }),
   });
@@ -262,6 +320,8 @@ export async function generateGgufChat(params: {
   messages: OpenAiChatMessage[];
   defaultSystemInstruction?: string;
   temperature?: number;
+  topP?: number;
+  stop?: string | string[];
   maxTokens?: number;
 }): Promise<{
   text: string;
@@ -283,10 +343,13 @@ export async function generateGgufChat(params: {
   const res = await fetch(`http://127.0.0.1:${inst.port}/v1/chat/completions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    signal: AbortSignal.timeout(120_000),
     body: JSON.stringify({
       messages: payloadMessages,
       stream: false,
       temperature: params.temperature ?? 0.7,
+      top_p: params.topP,
+      stop: params.stop,
       max_tokens: params.maxTokens,
     }),
   });

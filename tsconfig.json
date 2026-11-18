@@ -21,6 +21,8 @@
         "./*"
       ]
     },
+    "strict": true,
+    "noImplicitOverride": true,
     "allowImportingTsExtensions": true,
     "noEmit": true
   },

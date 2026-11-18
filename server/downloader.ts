@@ -18,6 +18,8 @@ import {
   extractQuantizationFromName,
   resolveAppDataDirs,
 } from './hardware.ts';
+import { logger } from './logger.ts';
+import { assertSafeChildPath, assertSafeRemoteUrl, safeFetch } from './security.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -30,6 +32,8 @@ interface LocalModelMetaEntry {
 
 type DownloadListener = () => void;
 
+export type LlamaBackendPreference = 'auto' | 'cpu' | 'cuda' | 'vulkan';
+
 const OLLAMA_POPULAR_MODELS: Array<{ id: string; desc: string; tags: string[] }> = [
   { id: 'qwen2.5', desc: 'Alibaba Qwen 2.5 (0.5B — 72B)', tags: ['0.5b', '1.5b', '3b', '7b', '14b', '32b'] },
   { id: 'llama3.2', desc: 'Meta Llama 3.2 (1B, 3B)', tags: ['1b', '3b', 'latest'] },
@@ -41,15 +45,15 @@ const OLLAMA_POPULAR_MODELS: Array<{ id: string; desc: string; tags: string[] }>
   { id: 'nomic-embed-text', desc: 'Nomic Embed Text (Embeddings)', tags: ['latest'] },
 ];
 
-function sanitizeFileName(raw: string): string {
+export function sanitizeFileName(raw: string): string {
   const base = path.basename(raw).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_');
-  if (!base) return `model-${Date.now()}.gguf`;
+  if (!base || base === '.' || base === '..') return `model-${Date.now()}.gguf`;
   return base.toLowerCase().endsWith('.gguf') ? base : `${base}.gguf`;
 }
 
 function authHeadersForSource(source: HubSource): Record<string, string> {
   const headers: Record<string, string> = {
-    'User-Agent': 'vllm-gateway/1.0',
+    'User-Agent': 'vllm-gateway/0.1',
   };
   if (source === 'huggingface' && process.env.HF_TOKEN?.trim()) {
     headers['Authorization'] = `Bearer ${process.env.HF_TOKEN.trim()}`;
@@ -62,9 +66,14 @@ function authHeadersForSource(source: HubSource): Record<string, string> {
 
 async function fetchOllamaBearerIfNeeded(
   url: string,
-  extraHeaders: Record<string, string> = {}
-): Promise<Response> {
-  const first = await fetch(url, { headers: { 'User-Agent': 'vllm-gateway/1.0', ...extraHeaders } });
+  extraHeaders: Record<string, string> = {},
+  signal?: AbortSignal
+): Promise<globalThis.Response> {
+  const first = await safeFetch(url, {
+    headers: { 'User-Agent': 'vllm-gateway/0.1', ...extraHeaders },
+    signal,
+    timeoutMs: 30_000,
+  });
   if (first.status !== 401) return first;
 
   const wwwAuth = first.headers.get('www-authenticate') ?? '';
@@ -77,18 +86,20 @@ async function fetchOllamaBearerIfNeeded(
   if (serviceMatch) tokenUrl.searchParams.set('service', serviceMatch[1]);
   if (scopeMatch) tokenUrl.searchParams.set('scope', scopeMatch[1]);
 
-  const tokenRes = await fetch(tokenUrl.toString());
+  const tokenRes = await safeFetch(tokenUrl.toString(), { timeoutMs: 15_000 });
   if (!tokenRes.ok) return first;
   const tokenJson = (await tokenRes.json()) as { token?: string; access_token?: string };
   const token = tokenJson.token || tokenJson.access_token;
   if (!token) return first;
 
-  return fetch(url, {
+  return safeFetch(url, {
     headers: {
-      'User-Agent': 'vllm-gateway/1.0',
+      'User-Agent': 'vllm-gateway/0.1',
       Authorization: `Bearer ${token}`,
       ...extraHeaders,
     },
+    signal,
+    timeoutMs: 60_000,
   });
 }
 
@@ -106,7 +117,10 @@ export async function searchHubModels(source: HubSource, query: string): Promise
     url.searchParams.set('direction', '-1');
     url.searchParams.set('limit', '15');
 
-    const res = await fetch(url.toString(), { headers: authHeadersForSource('huggingface') });
+    const res = await safeFetch(url.toString(), {
+      headers: authHeadersForSource('huggingface'),
+      timeoutMs: 15_000,
+    });
     if (!res.ok) {
       throw new Error(`Hugging Face API вернул HTTP ${res.status}`);
     }
@@ -139,7 +153,6 @@ export async function searchHubModels(source: HubSource, query: string): Promise
   }
 
   if (source === 'ollama') {
-    // Allow direct repo queries like "qwen2.5:7b" or search in Ollama registry catalog
     const normalized = q.toLowerCase();
     const matched = OLLAMA_POPULAR_MODELS.filter(
       (m) =>
@@ -177,7 +190,10 @@ export async function searchHubModels(source: HubSource, query: string): Promise
     url.searchParams.set('page', '1');
     url.searchParams.set('per_page', '15');
 
-    const res = await fetch(url.toString(), { headers: authHeadersForSource('modelscope') });
+    const res = await safeFetch(url.toString(), {
+      headers: authHeadersForSource('modelscope'),
+      timeoutMs: 12_000,
+    });
     if (res.ok) {
       const json = (await res.json()) as {
         Data?: {
@@ -207,10 +223,9 @@ export async function searchHubModels(source: HubSource, query: string): Promise
       }
     }
   } catch {
-    // Fall back to direct repo lookup when search endpoint is throttled
+    // Fall back to known GGUF repos if search endpoint throttles
   }
 
-  // Fallback suggestions if ModelScope public search returns empty or blocked
   const fallbacks = [
     { id: 'Qwen/Qwen2.5-3B-Instruct-GGUF', name: 'Qwen2.5-3B-Instruct-GGUF', author: 'Qwen' },
     { id: 'Qwen/Qwen2.5-7B-Instruct-GGUF', name: 'Qwen2.5-7B-Instruct-GGUF', author: 'Qwen' },
@@ -241,16 +256,16 @@ export async function listHubGgufFiles(
   if (!cleanRepo) throw new Error('Укажите идентификатор модели или URL.');
 
   if (source === 'huggingface') {
-    let filesRes = await fetch(
+    let filesRes = await safeFetch(
       `https://huggingface.co/api/models/${encodeURI(cleanRepo)}/tree/main?recursive=true`,
-      { headers: authHeadersForSource('huggingface') }
+      { headers: authHeadersForSource('huggingface'), timeoutMs: 15_000 }
     );
     let branch = 'main';
     if (filesRes.status === 404) {
       branch = 'master';
-      filesRes = await fetch(
+      filesRes = await safeFetch(
         `https://huggingface.co/api/models/${encodeURI(cleanRepo)}/tree/master?recursive=true`,
-        { headers: authHeadersForSource('huggingface') }
+        { headers: authHeadersForSource('huggingface'), timeoutMs: 15_000 }
       );
     }
     if (!filesRes.ok) {
@@ -320,7 +335,7 @@ export async function listHubGgufFiles(
           compatibility: sizeBytes ? assessModelCompatibility(hw, sizeBytes, ctxLen) : null,
         });
       } catch {
-        // Ignore single tag probe failure
+        // Ignore single tag failure
       }
     }
 
@@ -332,15 +347,15 @@ export async function listHubGgufFiles(
 
   if (source === 'modelscope') {
     let revision = 'master';
-    let res = await fetch(
+    let res = await safeFetch(
       `https://modelscope.cn/api/v1/models/${cleanRepo}/repo/files?Revision=master&Recursive=true`,
-      { headers: authHeadersForSource('modelscope') }
+      { headers: authHeadersForSource('modelscope'), timeoutMs: 15_000 }
     );
     if (!res.ok) {
       revision = 'main';
-      res = await fetch(
+      res = await safeFetch(
         `https://modelscope.cn/api/v1/models/${cleanRepo}/repo/files?Revision=main&Recursive=true`,
-        { headers: authHeadersForSource('modelscope') }
+        { headers: authHeadersForSource('modelscope'), timeoutMs: 15_000 }
       );
     }
     if (!res.ok) {
@@ -373,7 +388,6 @@ export async function listHubGgufFiles(
       .sort((a, b) => (a.sizeBytes ?? 0) - (b.sizeBytes ?? 0));
   }
 
-  // Direct URL probe
   return [await probeDirectGgufUrl(cleanRepo, ctxLen, hw)];
 }
 
@@ -383,16 +397,12 @@ export async function probeDirectGgufUrl(
   existingHw?: HardwareProfile
 ): Promise<HubGgufFile> {
   const hw = existingHw ?? (await detectHardwareProfile());
-  let parsed: URL;
-  try {
-    parsed = new URL(rawUrl.trim());
-  } catch {
-    throw new Error('Некорректный формат URL.');
-  }
+  const parsed = await assertSafeRemoteUrl(rawUrl);
 
-  let res = await fetch(parsed.toString(), {
+  let res = await safeFetch(parsed.toString(), {
     method: 'HEAD',
-    headers: { 'User-Agent': 'vllm-gateway/1.0' },
+    headers: { 'User-Agent': 'vllm-gateway/0.1' },
+    timeoutMs: 15_000,
   });
   let sizeBytes: number | null = null;
   const lenHeader = res.headers.get('content-length');
@@ -402,12 +412,13 @@ export async function probeDirectGgufUrl(
   }
 
   if (!res.ok || sizeBytes === null) {
-    res = await fetch(parsed.toString(), {
+    res = await safeFetch(parsed.toString(), {
       method: 'GET',
       headers: {
-        'User-Agent': 'vllm-gateway/1.0',
+        'User-Agent': 'vllm-gateway/0.1',
         Range: 'bytes=0-0',
       },
+      timeoutMs: 15_000,
     });
     const rangeHeader = res.headers.get('content-range');
     if (rangeHeader) {
@@ -537,17 +548,19 @@ class GgufDownloadManager {
     throw new Error('Локальный GGUF-файл не найден.');
   }
 
-  public startDownload(input: {
+  public async startDownload(input: {
     source: HubSource;
     repoId: string;
     fileName: string;
     downloadUrl: string;
     totalBytes?: number | null;
     quantization?: string;
-  }): ModelDownloadJob {
+  }): Promise<ModelDownloadJob> {
+    await assertSafeRemoteUrl(input.downloadUrl);
+
     const { modelsDir } = resolveAppDataDirs();
     const cleanName = sanitizeFileName(input.fileName);
-    const targetPath = path.join(modelsDir, cleanName);
+    const targetPath = assertSafeChildPath(modelsDir, cleanName);
     const id = `dl-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
 
     const job: ModelDownloadJob = {
@@ -569,6 +582,11 @@ class GgufDownloadManager {
     };
 
     this.jobs.set(id, job);
+    logger.info('downloader', 'Запуск загрузки GGUF-модели', {
+      id: job.id,
+      source: job.source,
+      fileName: job.fileName,
+    });
     this.notify(true);
     void this.runDownloadLoop(job);
     return { ...job };
@@ -639,8 +657,12 @@ class GgufDownloadManager {
 
       const res =
         job.source === 'ollama'
-          ? await fetchOllamaBearerIfNeeded(job.downloadUrl, headers)
-          : await fetch(job.downloadUrl, { headers, signal: controller.signal });
+          ? await fetchOllamaBearerIfNeeded(job.downloadUrl, headers, controller.signal)
+          : await safeFetch(job.downloadUrl, {
+              headers,
+              signal: controller.signal,
+              timeoutMs: 120_000,
+            });
 
       if (!res.ok && res.status !== 206) {
         throw new Error(`HTTP ${res.status}: ${res.statusText}`);
@@ -731,6 +753,10 @@ class GgufDownloadManager {
       job.speedBytesPerSec = 0;
       job.etaSeconds = 0;
       job.updatedAtMs = Date.now();
+      logger.info('downloader', 'Загрузка GGUF-модели завершена', {
+        fileName: job.fileName,
+        bytes: job.totalBytes,
+      });
       this.notify(true);
     } catch (err) {
       if ((job.status as string) === 'paused' || (job.status as string) === 'cancelled') {
@@ -741,6 +767,10 @@ class GgufDownloadManager {
       job.etaSeconds = null;
       job.errorMessage = err instanceof Error ? err.message : String(err);
       job.updatedAtMs = Date.now();
+      logger.error('downloader', 'Ошибка загрузки GGUF-модели', {
+        fileName: job.fileName,
+        error: job.errorMessage,
+      });
       this.notify(true);
     } finally {
       this.controllers.delete(job.id);
@@ -750,51 +780,256 @@ class GgufDownloadManager {
 
 export const downloadManager = new GgufDownloadManager();
 
-export async function installLlamaServerRuntime(): Promise<{
+function selectLlamaAssetMatchers(
+  hw: HardwareProfile,
+  backend: LlamaBackendPreference
+): RegExp[] {
+  const hasNvidia = hw.gpus.some((g) => g.vendor === 'nvidia');
+  const preferCuda = backend === 'cuda' || (backend === 'auto' && hasNvidia);
+  const preferVulkan = backend === 'vulkan';
+
+  if (hw.osPlatform === 'win32' && hw.arch === 'x64') {
+    if (preferCuda) {
+      return [
+        /^llama-.*-bin-win-cuda-12\.\d+-x64\.zip$/i,
+        /^llama-.*-bin-win-cuda-.*-x64\.zip$/i,
+        /^llama-.*-bin-win-vulkan-x64\.zip$/i,
+        /^llama-.*-bin-win-cpu-x64\.zip$/i,
+      ];
+    }
+    if (preferVulkan) {
+      return [/^llama-.*-bin-win-vulkan-x64\.zip$/i, /^llama-.*-bin-win-cpu-x64\.zip$/i];
+    }
+    return [/^llama-.*-bin-win-cpu-x64\.zip$/i];
+  }
+
+  if (hw.osPlatform === 'win32' && hw.arch === 'arm64') {
+    return [/^llama-.*-bin-win-cpu-arm64\.zip$/i];
+  }
+
+  if (hw.osPlatform === 'linux' && hw.arch === 'x64') {
+    if (preferCuda) {
+      return [
+        /^llama-.*-bin-ubuntu-cuda-12\.\d+-x64\.tar\.gz$/i,
+        /^llama-.*-bin-ubuntu-cuda-.*-x64\.tar\.gz$/i,
+        /^llama-.*-bin-ubuntu-x64\.tar\.gz$/i,
+      ];
+    }
+    if (preferVulkan) {
+      return [/^llama-.*-bin-ubuntu-vulkan-x64\.tar\.gz$/i, /^llama-.*-bin-ubuntu-x64\.tar\.gz$/i];
+    }
+    return [/^llama-.*-bin-ubuntu-x64\.tar\.gz$/i];
+  }
+
+  if (hw.osPlatform === 'linux' && hw.arch === 'arm64') {
+    return [/^llama-.*-bin-ubuntu-arm64\.tar\.gz$/i];
+  }
+
+  if (hw.osPlatform === 'darwin' && hw.arch === 'arm64') {
+    return [/^llama-.*-bin-macos-arm64\.tar\.gz$/i];
+  }
+
+  if (hw.osPlatform === 'darwin' && hw.arch === 'x64') {
+    return [/^llama-.*-bin-macos-x64\.tar\.gz$/i];
+  }
+
+  return [];
+}
+
+async function extractArchiveSafely(
+  archivePath: string,
+  extractTmp: string,
+  platform: string
+): Promise<void> {
+  const lower = archivePath.toLowerCase();
+  if (lower.endsWith('.tar.gz') || lower.endsWith('.tgz')) {
+    const { stdout } = await execFileAsync('tar', ['-tzf', archivePath], { timeout: 20_000 });
+    for (const entry of stdout.split(/\r?\n/).filter(Boolean)) {
+      if (path.isAbsolute(entry) || entry.split('/').includes('..')) {
+        throw new Error(`Небезопасный путь в архиве (Zip-Slip): ${entry}`);
+      }
+    }
+    await execFileAsync('tar', ['-xzf', archivePath, '-C', extractTmp], { timeout: 45_000 });
+  } else if (lower.endsWith('.zip')) {
+    if (platform === 'win32') {
+      await execFileAsync(
+        'powershell',
+        [
+          '-NoProfile',
+          '-Command',
+          `Expand-Archive -Path "${archivePath}" -DestinationPath "${extractTmp}" -Force`,
+        ],
+        { timeout: 45_000 }
+      );
+    } else {
+      const { stdout } = await execFileAsync('unzip', ['-Z1', archivePath], { timeout: 20_000 });
+      for (const entry of stdout.split(/\r?\n/).filter(Boolean)) {
+        if (path.isAbsolute(entry) || entry.split('/').includes('..')) {
+          throw new Error(`Небезопасный путь в ZIP-архиве (Zip-Slip): ${entry}`);
+        }
+      }
+      await execFileAsync('unzip', ['-o', archivePath, '-d', extractTmp], { timeout: 45_000 });
+    }
+  } else {
+    throw new Error('Поддерживаются только архивы форматов .zip, .tar.gz и .tgz');
+  }
+}
+
+function copyBinariesFromExtractedTree(
+  extractTmp: string,
+  binDir: string,
+  platform: string
+): string {
+  const exeName = platform === 'win32' ? 'llama-server.exe' : 'llama-server';
+  const foundServer = findFileRecursive(extractTmp, exeName);
+  if (!foundServer) {
+    throw new Error(`Исполняемый файл ${exeName} не найден внутри архива.`);
+  }
+
+  const sourceDir = path.dirname(foundServer);
+  for (const item of fs.readdirSync(sourceDir)) {
+    const src = path.join(sourceDir, item);
+    const stat = fs.lstatSync(src);
+    if (stat.isSymbolicLink()) {
+      const realTarget = fs.realpathSync(src);
+      if (!realTarget.startsWith(path.resolve(extractTmp))) {
+        throw new Error(`Обнаружена небезопасная символическая ссылка в архиве: ${item}`);
+      }
+    }
+    if (!fs.statSync(src).isFile()) continue;
+    if (
+      item === exeName ||
+      item.endsWith('.so') ||
+      item.includes('.so.') ||
+      item.endsWith('.dylib') ||
+      item.endsWith('.dll')
+    ) {
+      const dest = assertSafeChildPath(binDir, item);
+      fs.copyFileSync(src, dest);
+      if (platform !== 'win32') {
+        fs.chmodSync(dest, 0o755);
+      }
+    }
+  }
+
+  return path.join(binDir, exeName);
+}
+
+export async function installLlamaServerFromArchive(params: {
+  archivePath?: string;
+  fileName?: string;
+  buffer?: Buffer;
+}): Promise<{ installedPath: string; assetName: string }> {
+  const { binDir, archivesDir, vendorArchivesDir } = resolveAppDataDirs();
+  const hw = await detectHardwareProfile(true);
+
+  let resolvedArchivePath = params.archivePath?.trim() || '';
+  let assetName = params.fileName?.trim() || (resolvedArchivePath ? path.basename(resolvedArchivePath) : '');
+
+  if (params.buffer && params.buffer.length > 0) {
+    const safeName = path.basename(assetName || `llama-archive-${Date.now()}.zip`).replace(
+      /[<>:"/\\|?*\x00-\x1f]/g,
+      '_'
+    );
+    resolvedArchivePath = assertSafeChildPath(archivesDir, safeName);
+    fs.writeFileSync(resolvedArchivePath, params.buffer);
+    assetName = safeName;
+  } else if (resolvedArchivePath && !path.isAbsolute(resolvedArchivePath)) {
+    // Allow passing bare archive filename located in vendor/llama-server or ~/.vllm-gateway/archives
+    const inVendor = path.join(vendorArchivesDir, path.basename(resolvedArchivePath));
+    const inData = path.join(archivesDir, path.basename(resolvedArchivePath));
+    if (fs.existsSync(inVendor)) resolvedArchivePath = inVendor;
+    else if (fs.existsSync(inData)) resolvedArchivePath = inData;
+  }
+
+  if (!resolvedArchivePath || !fs.existsSync(resolvedArchivePath)) {
+    throw new Error('Архив llama-server не найден. Поместите .zip/.tar.gz в vendor/llama-server или загрузите файл.');
+  }
+
+  // Verify the source path stays inside known safe directories if selected by name
+  const resolvedReal = path.resolve(resolvedArchivePath);
+  const allowedRoots = [path.resolve(vendorArchivesDir), path.resolve(archivesDir)];
+  if (!allowedRoots.some((root) => resolvedReal.startsWith(root))) {
+    throw new Error('Разрешена установка только из директории vendor/llama-server или archives.');
+  }
+
+  const extractTmp = path.join(binDir, `extract-${Date.now()}`);
+  fs.mkdirSync(extractTmp, { recursive: true });
+
+  try {
+    await extractArchiveSafely(resolvedReal, extractTmp, hw.osPlatform);
+    const installedPath = copyBinariesFromExtractedTree(extractTmp, binDir, hw.osPlatform);
+    await detectHardwareProfile(true);
+    logger.info('runtime', 'llama-server установлен из локального архива', {
+      assetName,
+      installedPath,
+    });
+    return { installedPath, assetName };
+  } finally {
+    fs.rmSync(extractTmp, { recursive: true, force: true });
+  }
+}
+
+export async function installLlamaServerRuntime(
+  backend: LlamaBackendPreference = 'auto'
+): Promise<{
   installedPath: string;
   assetName: string;
+  releaseTag: string;
 }> {
   const { binDir } = resolveAppDataDirs();
   const hw = await detectHardwareProfile(true);
 
-  const relRes = await fetch('https://api.github.com/repos/ggml-org/llama.cpp/releases/latest', {
-    headers: { 'User-Agent': 'vllm-gateway/1.0', Accept: 'application/vnd.github+json' },
+  const relRes = await safeFetch('https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=10', {
+    headers: { 'User-Agent': 'vllm-gateway/0.1', Accept: 'application/vnd.github+json' },
+    timeoutMs: 15_000,
   });
   if (!relRes.ok) {
     throw new Error(`Не удалось получить список релизов llama.cpp с GitHub (HTTP ${relRes.status}).`);
   }
 
-  const release = (await relRes.json()) as {
+  const releases = (await relRes.json()) as Array<{
     tag_name?: string;
+    draft?: boolean;
+    prerelease?: boolean;
     assets?: Array<{ name: string; browser_download_url: string }>;
-  };
-  const assets = release.assets ?? [];
+  }>;
 
-  let matcher: RegExp;
-  if (hw.osPlatform === 'linux' && hw.arch === 'x64') {
-    matcher = /bin-ubuntu-x64\.(tar\.gz|zip)$/i;
-  } else if (hw.osPlatform === 'darwin' && hw.arch === 'arm64') {
-    matcher = /bin-macos-arm64\.(tar\.gz|zip)$/i;
-  } else if (hw.osPlatform === 'darwin' && hw.arch === 'x64') {
-    matcher = /bin-macos-x64\.(tar\.gz|zip)$/i;
-  } else if (hw.osPlatform === 'win32' && hw.arch === 'x64') {
-    matcher = /bin-win-cpu-x64\.zip$/i;
-  } else {
+  const release = releases.find(
+    (r) =>
+      !r.draft &&
+      !r.prerelease &&
+      Array.isArray(r.assets) &&
+      r.assets.some((a) => /^llama-.*-bin-/i.test(a.name))
+  );
+
+  if (!release || !release.assets) {
+    throw new Error('Не найден релиз llama.cpp с бинарными сборками (llama-*-bin-*).');
+  }
+
+  const matchers = selectLlamaAssetMatchers(hw, backend);
+  if (matchers.length === 0) {
     throw new Error(
-      `Автоматическая загрузка llama-server для ${hw.osPlatform}/${hw.arch} не поддерживается. Установите llama.cpp вручную.`
+      `Автоматическая загрузка llama-server для ${hw.osPlatform}/${hw.arch} не поддерживается. Добавьте архив вручную в vendor/llama-server.`
     );
   }
 
-  const asset = assets.find((a) => matcher.test(a.name));
+  let asset: { name: string; browser_download_url: string } | undefined;
+  for (const matcher of matchers) {
+    asset = release.assets.find((a) => matcher.test(a.name));
+    if (asset) break;
+  }
+
   if (!asset) {
     throw new Error(
-      `В релизе ${release.tag_name ?? 'latest'} не найден подходящий архив для ${hw.osPlatform}/${hw.arch}.`
+      `В релизе ${release.tag_name ?? 'latest'} не найден архив для ${hw.osPlatform}/${hw.arch} (${backend}).`
     );
   }
 
-  const archivePath = path.join(binDir, asset.name);
-  const dlRes = await fetch(asset.browser_download_url, {
-    headers: { 'User-Agent': 'vllm-gateway/1.0' },
+  const archivePath = assertSafeChildPath(binDir, asset.name);
+  const dlRes = await safeFetch(asset.browser_download_url, {
+    headers: { 'User-Agent': 'vllm-gateway/0.1' },
+    timeoutMs: 120_000,
   });
   if (!dlRes.ok || !dlRes.body) {
     throw new Error(`Ошибка загрузки архива ${asset.name}: HTTP ${dlRes.status}`);
@@ -807,48 +1042,49 @@ export async function installLlamaServerRuntime(): Promise<{
   fs.mkdirSync(extractTmp, { recursive: true });
 
   try {
-    if (asset.name.endsWith('.tar.gz')) {
-      await execFileAsync('tar', ['-xzf', archivePath, '-C', extractTmp], { timeout: 30000 });
-    } else if (hw.osPlatform === 'win32') {
-      await execFileAsync(
-        'powershell',
-        ['-NoProfile', '-Command', `Expand-Archive -Path "${archivePath}" -DestinationPath "${extractTmp}" -Force`],
-        { timeout: 30000 }
+    await extractArchiveSafely(archivePath, extractTmp, hw.osPlatform);
+    const installedPath = copyBinariesFromExtractedTree(extractTmp, binDir, hw.osPlatform);
+
+    // On Windows CUDA builds, also install matching cudart DLL bundle if present
+    if (hw.osPlatform === 'win32' && /win-cuda-12/i.test(asset.name)) {
+      const cudartAsset = release.assets.find((a) =>
+        /^cudart-llama-bin-win-cuda-12\.\d+-x64\.zip$/i.test(a.name)
       );
-    } else {
-      await execFileAsync('unzip', ['-o', archivePath, '-d', extractTmp], { timeout: 30000 });
-    }
-
-    const exeName = hw.osPlatform === 'win32' ? 'llama-server.exe' : 'llama-server';
-    const foundServer = findFileRecursive(extractTmp, exeName);
-    if (!foundServer) {
-      throw new Error(`Файл ${exeName} не найден внутри архива ${asset.name}.`);
-    }
-
-    // Copy binary + any shared libs (.so / .dylib / .dll) from same directory
-    const sourceDir = path.dirname(foundServer);
-    for (const item of fs.readdirSync(sourceDir)) {
-      const src = path.join(sourceDir, item);
-      if (!fs.statSync(src).isFile()) continue;
-      if (
-        item === exeName ||
-        item.endsWith('.so') ||
-        item.includes('.so.') ||
-        item.endsWith('.dylib') ||
-        item.endsWith('.dll')
-      ) {
-        const dest = path.join(binDir, item);
-        fs.copyFileSync(src, dest);
-        if (hw.osPlatform !== 'win32') {
-          fs.chmodSync(dest, 0o755);
+      if (cudartAsset) {
+        const cudartArchive = assertSafeChildPath(binDir, cudartAsset.name);
+        const cudartTmp = path.join(binDir, `extract-cudart-${Date.now()}`);
+        fs.mkdirSync(cudartTmp, { recursive: true });
+        try {
+          const cRes = await safeFetch(cudartAsset.browser_download_url, {
+            headers: { 'User-Agent': 'vllm-gateway/0.1' },
+            timeoutMs: 60_000,
+          });
+          if (cRes.ok) {
+            fs.writeFileSync(cudartArchive, Buffer.from(await cRes.arrayBuffer()));
+            await extractArchiveSafely(cudartArchive, cudartTmp, hw.osPlatform);
+            for (const f of fs.readdirSync(cudartTmp)) {
+              if (f.toLowerCase().endsWith('.dll')) {
+                fs.copyFileSync(path.join(cudartTmp, f), assertSafeChildPath(binDir, f));
+              }
+            }
+          }
+        } finally {
+          fs.rmSync(cudartTmp, { recursive: true, force: true });
+          if (fs.existsSync(cudartArchive)) fs.unlinkSync(cudartArchive);
         }
       }
     }
 
     await detectHardwareProfile(true);
-    return {
-      installedPath: path.join(binDir, exeName),
+    logger.info('runtime', 'llama-server установлен с GitHub Releases', {
+      releaseTag: release.tag_name,
       assetName: asset.name,
+      installedPath,
+    });
+    return {
+      installedPath,
+      assetName: asset.name,
+      releaseTag: release.tag_name ?? 'latest',
     };
   } finally {
     fs.rmSync(extractTmp, { recursive: true, force: true });

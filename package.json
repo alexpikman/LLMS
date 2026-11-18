@@ -1,7 +1,9 @@
 {
-  "name": "react-example",
+  "name": "vllm-gateway",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
+  "description": "High-performance LLM inference gateway supporting local GGUF (CPU/GPU), OpenAI-compatible API, and hardware compatibility profiling.",
+  "license": "Apache-2.0",
   "type": "module",
   "scripts": {
     "dev": "tsx server.ts",
@@ -11,7 +13,8 @@
     "build:release": "node scripts/build-release.mjs --sea",
     "preview": "vite preview",
     "clean": "rm -rf dist dist-server release-build server.js",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "node --test tests/*.test.ts"
   },
   "dependencies": {
     "@google/genai": "^3.5.0",

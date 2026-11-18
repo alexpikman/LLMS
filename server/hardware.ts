@@ -7,6 +7,7 @@ import type {
   CompatibilityAssessment,
   GpuDeviceInfo,
   HardwareProfile,
+  LlamaArchiveInfo,
 } from '../src/types/engine.ts';
 
 const execFileAsync = promisify(execFile);
@@ -16,19 +17,63 @@ const MIB = 1024 * 1024;
 let cachedProfile: HardwareProfile | null = null;
 let cachedAtMs = 0;
 
-export function resolveAppDataDirs(): { dataDir: string; modelsDir: string; binDir: string } {
+export function resolveAppDataDirs(): {
+  dataDir: string;
+  modelsDir: string;
+  binDir: string;
+  archivesDir: string;
+  vendorArchivesDir: string;
+} {
   const dataDir =
     process.env.VLLM_DATA_DIR?.trim() || path.join(os.homedir(), '.vllm-gateway');
   const modelsDir = path.join(dataDir, 'models');
   const binDir = path.join(dataDir, 'bin');
+  const archivesDir = path.join(dataDir, 'archives');
+  const vendorArchivesDir = path.resolve(process.cwd(), 'vendor', 'llama-server');
 
-  for (const dir of [dataDir, modelsDir, binDir]) {
+  for (const dir of [dataDir, modelsDir, binDir, archivesDir]) {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
   }
 
-  return { dataDir, modelsDir, binDir };
+  return { dataDir, modelsDir, binDir, archivesDir, vendorArchivesDir };
+}
+
+export function scanLocalLlamaArchives(
+  archivesDir: string,
+  vendorArchivesDir: string
+): LlamaArchiveInfo[] {
+  const out: LlamaArchiveInfo[] = [];
+  const candidates: Array<{ dir: string; location: 'vendor' | 'data' }> = [
+    { dir: vendorArchivesDir, location: 'vendor' },
+    { dir: archivesDir, location: 'data' },
+  ];
+
+  for (const item of candidates) {
+    if (!fs.existsSync(item.dir)) continue;
+    try {
+      for (const entry of fs.readdirSync(item.dir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const lower = entry.name.toLowerCase();
+        if (!lower.endsWith('.zip') && !lower.endsWith('.tar.gz') && !lower.endsWith('.tgz')) {
+          continue;
+        }
+        const fullPath = path.join(item.dir, entry.name);
+        const stat = fs.statSync(fullPath);
+        out.push({
+          fileName: entry.name,
+          filePath: fullPath,
+          sizeBytes: stat.size,
+          location: item.location,
+        });
+      }
+    } catch {
+      // Ignore unreadable directories
+    }
+  }
+
+  return out;
 }
 
 function getLinuxAvailableRamBytes(fallbackFreeBytes: number): number {
@@ -180,7 +225,7 @@ export async function detectHardwareProfile(forceRefresh = false): Promise<Hardw
     return cachedProfile;
   }
 
-  const { modelsDir, binDir } = resolveAppDataDirs();
+  const { modelsDir, binDir, archivesDir, vendorArchivesDir } = resolveAppDataDirs();
   const cpus = os.cpus();
   const totalRamBytes = os.totalmem();
   const freeRamBytes = getLinuxAvailableRamBytes(os.freemem());
@@ -204,6 +249,7 @@ export async function detectHardwareProfile(forceRefresh = false): Promise<Hardw
   const freeVramBytes = gpus.reduce((sum, g) => sum + g.vramFreeBytes, 0);
 
   const llama = await findLlamaServerBinary(binDir);
+  const localArchives = scanLocalLlamaArchives(archivesDir, vendorArchivesDir);
 
   const profile: HardwareProfile = {
     hostname: os.hostname(),
@@ -223,9 +269,12 @@ export async function detectHardwareProfile(forceRefresh = false): Promise<Hardw
     diskTotalBytes,
     modelsDir,
     binDir,
+    archivesDir,
+    vendorArchivesDir,
     llamaServerPath: llama.path,
     llamaServerAvailable: Boolean(llama.path),
     llamaServerVersion: llama.version,
+    localArchives,
     detectedAtMs: now,
   };
 

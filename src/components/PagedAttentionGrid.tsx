@@ -110,7 +110,13 @@ export const PagedAttentionGrid: React.FC<PagedAttentionGridProps> = ({
             Динамическая сетка блоков PagedAttention и слотов KV-кэша
           </h1>
           <p className="text-xs text-slate-600 mt-0.5">
-            Реальное отображение страничной памяти: каждый блок разбит на {pagedAttention.blockSize} слотов токенов с подсчётом фактической внутренней фрагментации.
+            Режим телеметрии:{' '}
+            <span className="font-mono font-medium text-slate-900">
+              {pagedAttention.telemetryMode === 'hybrid_llama_slots'
+                ? 'гибрид (логическая модель шлюза + реальные слоты llama-server /slots)'
+                : 'логическая модель распределителя шлюза'}
+            </span>
+            . Блоки ({pagedAttention.blockSize} слотов/блок) рассчитываются по реальным токенам активных HTTP/SSE-запросов, а не напрямую из памяти GPU-драйвера.
           </p>
         </div>
 
@@ -227,6 +233,39 @@ export const PagedAttentionGrid: React.FC<PagedAttentionGridProps> = ({
           </div>
         </div>
       </div>
+
+      {pagedAttention.llamaSlots.length > 0 && (
+        <div className="bg-white border border-slate-200 rounded-lg p-4 space-y-2.5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-xs font-semibold text-slate-900">
+              Фактические слоты процесса llama-server (/slots)
+            </h2>
+            <span className="text-[11px] font-mono text-slate-500">
+              Опрос каждые 2.5 с · активных слотов:{' '}
+              {pagedAttention.llamaSlots.filter((s) => s.isProcessing).length}/
+              {pagedAttention.llamaSlots.length}
+            </span>
+          </div>
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-2">
+            {pagedAttention.llamaSlots.map((slot) => (
+              <div
+                key={`${slot.deploymentAlias}-${slot.slotId}`}
+                className={`p-2 rounded border text-[11px] font-mono ${
+                  slot.isProcessing
+                    ? 'bg-emerald-50 border-emerald-300 text-emerald-900'
+                    : 'bg-slate-50 border-slate-200 text-slate-600'
+                }`}
+              >
+                <div className="font-semibold truncate">{slot.deploymentAlias}</div>
+                <div>
+                  slot #{slot.slotId} · {slot.isProcessing ? 'занят' : 'ожидает'}
+                </div>
+                <div className="text-[10px] text-slate-500">n_ctx={slot.nCtx}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Main Split: Dynamic Block & Slot Grid + Page Table Inspector */}
       <div className="grid grid-cols-1 xl:grid-cols-12 gap-6 items-start">

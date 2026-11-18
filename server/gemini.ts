@@ -38,6 +38,10 @@ export interface GeminiTextRequest {
   messages: OpenAiChatMessage[];
   defaultSystemInstruction?: string;
   thinkingLevel?: ThinkingLevelOption;
+  temperature?: number;
+  topP?: number;
+  maxTokens?: number;
+  stop?: string | string[];
 }
 
 export interface GeminiUsage {
@@ -130,11 +134,21 @@ export async function* streamGeminiText(
     req.defaultSystemInstruction
   );
 
+  const stopSequences = Array.isArray(req.stop)
+    ? req.stop.slice(0, 4)
+    : typeof req.stop === 'string' && req.stop.length > 0
+    ? [req.stop]
+    : undefined;
+
   const responseStream = await ai.models.generateContentStream({
     model: req.baseModel,
     contents,
     config: {
       ...(systemInstruction ? { systemInstruction } : {}),
+      ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
+      ...(typeof req.topP === 'number' ? { topP: req.topP } : {}),
+      ...(typeof req.maxTokens === 'number' ? { maxOutputTokens: req.maxTokens } : {}),
+      ...(stopSequences ? { stopSequences } : {}),
       ...(req.baseModel === 'gemini-4-hydrogen'
         ? { thinkingConfig: { thinkingLevel: mapThinkingLevel(req.thinkingLevel) } }
         : {}),
@@ -168,11 +182,21 @@ export async function generateGeminiText(
     req.defaultSystemInstruction
   );
 
+  const stopSequences = Array.isArray(req.stop)
+    ? req.stop.slice(0, 4)
+    : typeof req.stop === 'string' && req.stop.length > 0
+    ? [req.stop]
+    : undefined;
+
   const response = await ai.models.generateContent({
     model: req.baseModel,
     contents,
     config: {
       ...(systemInstruction ? { systemInstruction } : {}),
+      ...(typeof req.temperature === 'number' ? { temperature: req.temperature } : {}),
+      ...(typeof req.topP === 'number' ? { topP: req.topP } : {}),
+      ...(typeof req.maxTokens === 'number' ? { maxOutputTokens: req.maxTokens } : {}),
+      ...(stopSequences ? { stopSequences } : {}),
       ...(req.baseModel === 'gemini-4-hydrogen'
         ? { thinkingConfig: { thinkingLevel: mapThinkingLevel(req.thinkingLevel) } }
         : {}),
