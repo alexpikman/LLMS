@@ -237,12 +237,12 @@ export class ModelServerRuntime {
     this.broadcast();
   }
 
-  public shutdown(): void {
+  public async shutdown(): Promise<void> {
     if (this.slotPollTimer) {
       clearInterval(this.slotPollTimer);
       this.slotPollTimer = null;
     }
-    stopAllGgufProcesses();
+    await stopAllGgufProcesses();
   }
 
   private initPagedPool(): void {
