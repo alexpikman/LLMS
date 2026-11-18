@@ -205,6 +205,16 @@ export function stopAllGgufProcesses(): void {
       if (inst.process.exitCode === null) {
         try {
           inst.process.kill('SIGTERM');
+          const forceKillTimer = setTimeout(() => {
+            if (inst.process.exitCode === null) {
+              try {
+                inst.process.kill('SIGKILL');
+              } catch {
+                // Ignore processes that exit during shutdown.
+              }
+            }
+          }, 1000);
+          inst.process.once('exit', () => clearTimeout(forceKillTimer));
         } catch {
           // Ignore cleanup error
         }
