@@ -69,7 +69,7 @@ export class ModelServerRuntime {
   private reqCounter = 1;
   private depCounter = 4;
 
-  // Real PagedAttention Physical Block Allocator & Scheduler state
+  // Gateway-side logical PagedAttention allocation model & scheduler state
   private pagedBlockSize: 16 | 32 = 16;
   private pagedTotalBlocks = 64;
   private kvMemoryUtilization = 1.0;
