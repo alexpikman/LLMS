@@ -198,7 +198,7 @@ export async function stopGgufProcess(deploymentId: string): Promise<void> {
 }
 
 function waitForProcessExit(
-  child: ChildProcessWithoutNullStreams,
+  child: ChildProcess,
   timeoutMs: number
 ): Promise<void> {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
