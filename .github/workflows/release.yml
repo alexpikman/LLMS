@@ -100,7 +100,7 @@ jobs:
         shell: pwsh
         run: |
           if ($env:GITHUB_REF.StartsWith("refs/tags/v")) {
-            $version = $env:GITHUB_REF_NAME.TrimStart("v")
+            $version = $env:GITHUB_REF_NAME.Substring(1)
           } else {
             $version = "0.0.0"
           }
