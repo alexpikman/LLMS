@@ -72,6 +72,12 @@ jobs:
             if (-not $ready) {
               throw "Standalone executable did not serve the UI on http://127.0.0.1:3003"
             }
+            Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/server/config" -Method Put -ContentType "application/json" -Body '{"port":3004}' | Out-Null
+            Start-Sleep -Seconds 1
+            $config = Invoke-RestMethod -Uri "http://127.0.0.1:3004/api/server/config" -TimeoutSec 5
+            if ($config.port -ne 3004) {
+              throw "Server did not apply the requested port 3004"
+            }
           } finally {
             if (-not $process.HasExited) {
               Stop-Process -Id $process.Id -Force
