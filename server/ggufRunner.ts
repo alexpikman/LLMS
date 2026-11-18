@@ -197,31 +197,44 @@ export async function stopGgufProcess(deploymentId: string): Promise<void> {
   }
 }
 
-export function stopAllGgufProcesses(): void {
-  for (const id of Array.from(runningProcesses.keys())) {
-    const inst = runningProcesses.get(id);
-    if (inst) {
-      inst.stoppingIntentional = true;
-      if (inst.process.exitCode === null) {
+function waitForProcessExit(
+  child: ChildProcessWithoutNullStreams,
+  timeoutMs: number
+): Promise<void> {
+  if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+  return new Promise((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      child.off('exit', finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, timeoutMs);
+    child.once('exit', finish);
+  });
+}
+
+export async function stopAllGgufProcesses(): Promise<void> {
+  const entries = Array.from(runningProcesses.entries());
+  await Promise.all(entries.map(async ([id, inst]) => {
+    inst.stoppingIntentional = true;
+    if (inst.process.exitCode === null && inst.process.signalCode === null) {
+      try {
+        inst.process.kill('SIGTERM');
+      } catch {
+        // Ignore cleanup errors for already terminated processes.
+      }
+      await waitForProcessExit(inst.process, 1000);
+      if (inst.process.exitCode === null && inst.process.signalCode === null) {
         try {
-          inst.process.kill('SIGTERM');
-          const forceKillTimer = setTimeout(() => {
-            if (inst.process.exitCode === null) {
-              try {
-                inst.process.kill('SIGKILL');
-              } catch {
-                // Ignore processes that exit during shutdown.
-              }
-            }
-          }, 1000);
-          inst.process.once('exit', () => clearTimeout(forceKillTimer));
+          inst.process.kill('SIGKILL');
         } catch {
-          // Ignore cleanup error
+          // Ignore processes that exit during forced shutdown.
         }
+        await waitForProcessExit(inst.process, 1000);
       }
     }
     runningProcesses.delete(id);
-  }
+  }));
 }
 
 export async function queryLlamaSlots(deploymentId: string): Promise<RawLlamaSlot[]> {
