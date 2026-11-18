@@ -443,7 +443,10 @@ export function createAuthMiddleware(authManager: AuthManager) {
           return;
         }
         try {
-          if (new URL(origin).host !== host) {
+          const originUrl = new URL(origin);
+          const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim();
+          const expectedProtocol = req.secure || forwardedProto === 'https' ? 'https:' : 'http:';
+          if (originUrl.host !== host || originUrl.protocol !== expectedProtocol) {
             res.status(403).json(openAiError('Cross-origin запросы с cookie-сессией запрещены.', 'forbidden', null, 'csrf_check_failed'));
             return;
           }
