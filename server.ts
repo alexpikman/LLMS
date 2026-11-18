@@ -1207,9 +1207,11 @@ async function startServer() {
   const handleSignal = () => {
     const engine = app.locals.engine as ModelServerRuntime;
     const activeServer = app.locals.server as ReturnType<typeof app.listen>;
-    engine.shutdown();
-    activeServer.close(() => process.exit(0));
+    activeServer.close();
     activeServer.closeAllConnections?.();
+    void engine.shutdown()
+      .catch((err) => console.error('Failed to stop inference processes:', err))
+      .finally(() => process.exit(0));
   };
   process.once('SIGINT', handleSignal);
   process.once('SIGTERM', handleSignal);
