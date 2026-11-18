@@ -69,6 +69,8 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
 
     const unauthState = await fetch(`${baseUrl}/api/engine/state`);
     assert.equal(unauthState.status, 401);
+    const unauthConfig = await fetch(`${baseUrl}/api/server/config`);
+    assert.equal(unauthConfig.status, 401);
   });
 
   it('completes setup once, authenticates via Bearer token & session cookie, and validates OpenAI payloads', async () => {
@@ -120,6 +122,23 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
       headers: { Cookie: cookie },
     });
     assert.equal(cookieModels.status, 200);
+
+    const csrfBlocked = await fetch(`${baseUrl}/api/engine/cache/clear`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(csrfBlocked.status, 403);
+
+    const csrfAllowed = await fetch(`${baseUrl}/api/engine/cache/clear`, {
+      method: 'POST',
+      headers: { Cookie: cookie, Origin: baseUrl },
+    });
+    assert.equal(csrfAllowed.status, 200);
+
+    const protectedConfig = await fetch(`${baseUrl}/api/server/config`, {
+      headers: { Authorization: `Bearer ${setupJson.token}` },
+    });
+    assert.equal(protectedConfig.status, 200);
 
     // OpenAI parameter validation (400 / 404)
     const emptyMsgs = await fetch(`${baseUrl}/v1/chat/completions`, {
