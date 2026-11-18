@@ -117,9 +117,11 @@ jobs:
             if (-not $ready) {
               throw "Standalone executable did not serve the UI on http://127.0.0.1:3003"
             }
-            Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/server/config" -Method Put -ContentType "application/json" -Body '{"port":3004}' | Out-Null
+            $auth = Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/auth/setup" -Method Post -ContentType "application/json" -Body '{}'
+            $headers = @{ Authorization = "Bearer $($auth.token)" }
+            Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/server/config" -Method Put -Headers $headers -ContentType "application/json" -Body '{"port":3004}' | Out-Null
             Start-Sleep -Seconds 1
-            $config = Invoke-RestMethod -Uri "http://127.0.0.1:3004/api/server/config" -TimeoutSec 5
+            $config = Invoke-RestMethod -Uri "http://127.0.0.1:3004/api/server/config" -Headers $headers -TimeoutSec 5
             if ($config.port -ne 3004) {
               throw "Server did not apply the requested port 3004"
             }
