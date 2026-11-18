@@ -181,6 +181,22 @@ export async function createGatewayApp(options: {
 
   app.post('/v1/chat/completions', async (req, res) => {
     const body = req.body ?? {};
+    if (body.temperature !== undefined && (typeof body.temperature !== 'number' || body.temperature < 0 || body.temperature > 2)) {
+      res.status(400).json({ error: { message: 'temperature должен быть числом от 0 до 2.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.top_p !== undefined && (typeof body.top_p !== 'number' || body.top_p <= 0 || body.top_p > 1)) {
+      res.status(400).json({ error: { message: 'top_p должен быть числом больше 0 и не больше 1.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.n !== undefined && body.n !== 1) {
+      res.status(400).json({ error: { message: 'Поддерживается только n=1.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.max_tokens !== undefined && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1)) {
+      res.status(400).json({ error: { message: 'max_tokens должен быть положительным целым числом.', type: 'invalid_request_error' } });
+      return;
+    }
     const messages = Array.isArray(body.messages) ? (body.messages as OpenAiChatMessage[]) : [];
     if (messages.length === 0) {
       res.status(400).json({
@@ -751,6 +767,10 @@ export async function createGatewayApp(options: {
 
   app.post('/v1/embeddings', async (req, res) => {
     const body = req.body ?? {};
+    if (body.encoding_format !== undefined && !['float', 'base64'].includes(body.encoding_format)) {
+      res.status(400).json({ error: { message: 'encoding_format должен быть float или base64.', type: 'invalid_request_error' } });
+      return;
+    }
     const rawInput = body.input;
     const inputs = Array.isArray(rawInput)
       ? rawInput.map(String)
@@ -830,6 +850,17 @@ export async function createGatewayApp(options: {
   // =========================================================================
   // Model Lifecycle & Real Telemetry Endpoints (/api/*)
   // =========================================================================
+  app.get('/api/diagnostics', (_req, res) => {
+    res.json({
+      version: '0.1.0',
+      nodeVersion: process.version,
+      platform: process.platform,
+      architecture: process.arch,
+      uptimeSeconds: Math.floor(process.uptime()),
+      snapshot: modelServer.getSnapshot(),
+    });
+  });
+
   app.get('/api/engine/state', (_req, res) => {
     res.json(modelServer.getSnapshot());
   });
