@@ -92,6 +92,15 @@ export async function createGatewayApp(options: {
   });
 
   app.post('/api/auth/setup', authRateLimiter, (req, res) => {
+    const remoteAddress = req.socket.remoteAddress?.replace(/^::ffff:/i, '');
+    if (
+      authManager.isSetupRequired() &&
+      remoteAddress !== '127.0.0.1' &&
+      remoteAddress !== '::1'
+    ) {
+      res.status(403).json({ error: 'Первичную настройку токена разрешено выполнять только с localhost. Для удалённого сервера задайте VLLM_API_KEY.' });
+      return;
+    }
     try {
       const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
       const result = authManager.setupInitialToken(requestedToken);
