@@ -282,7 +282,12 @@ export async function createGatewayApp(options: {
     const cacheKey = modelServer.computeCacheKey(deployment, { endpoint: 'chat', messages });
     const textModel = deployment.baseModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
-    await modelServer.acquireSlot(deployment.id, record);
+    try {
+      await modelServer.acquireSlot(deployment.id, record, streamAbortController?.signal);
+    } catch (err) {
+      if (streamAbortController?.signal.aborted) return;
+      throw err;
+    }
 
     try {
       const cached = modelServer.lookupCache(deployment, cacheKey);
