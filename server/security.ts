@@ -376,18 +376,18 @@ export class AuthManager {
     return this.verifySessionCookie(req.headers.cookie);
   }
 
-  public setSessionCookieHeader(res: Response): void {
+  public setSessionCookieHeader(res: Response, secure = false): void {
     const value = encodeURIComponent(this.signSessionCookie());
     res.setHeader(
       'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`
+      `${SESSION_COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${secure ? '; Secure' : ''}`
     );
   }
 
-  public clearSessionCookieHeader(res: Response): void {
+  public clearSessionCookieHeader(res: Response, secure = false): void {
     res.setHeader(
       'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
     );
   }
 
