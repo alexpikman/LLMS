@@ -116,6 +116,7 @@ git push origin v1.0.0
 ### Пример использования OpenAI API
 
 ```bash
+export VLLM_API_KEY="<TOKEN>"
 curl http://localhost:3003/v1/chat/completions \
   -H "Authorization: Bearer $VLLM_API_KEY" \
   -H "Content-Type: application/json" \
