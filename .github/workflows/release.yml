@@ -1,0 +1,89 @@
+name: Build & Publish Standalone Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+            archive: tar.gz
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+            archive: tar.gz
+          - os: macos-latest
+            target: macos-arm64
+            archive: tar.gz
+          - os: windows-latest
+            target: win-x64
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build standalone binary and frontend dist
+        run: npm run build:release
+
+      - name: Package release archive (Unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cp README.md release-build/README.md
+          cp .env.example release-build/.env.example
+          tar -czf "vllm-gateway-${{ matrix.target }}.tar.gz" -C release-build .
+
+      - name: Package release archive (Windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Copy-Item README.md release-build/README.md
+          Copy-Item .env.example release-build/.env.example
+          Compress-Archive -Path release-build/* -DestinationPath "vllm-gateway-${{ matrix.target }}.zip"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-gateway-${{ matrix.target }}
+          path: vllm-gateway-${{ matrix.target }}.*
+
+  publish-release:
+    needs: build-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all binary artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/*
+            install.sh
+            install.ps1

@@ -1,9 +1,12 @@
 export type BaseModelId =
   | 'gemini-4-hydrogen'
   | 'gemini-3.1-flash-lite'
-  | 'gemini-embedding-2';
+  | 'gemini-embedding-2'
+  | 'local-gguf';
 
+export type DeploymentProvider = 'cloud_gemini' | 'local_gguf';
 export type ModelCapability = 'text' | 'embedding';
+export type GgufDeviceMode = 'auto' | 'gpu' | 'cpu';
 
 export interface BaseModelCatalogItem {
   id: BaseModelId;
@@ -11,6 +14,7 @@ export interface BaseModelCatalogItem {
   capability: ModelCapability;
   description: string;
   supportsThinking: boolean;
+  provider: DeploymentProvider;
 }
 
 export const BASE_MODEL_CATALOG: Record<BaseModelId, BaseModelCatalogItem> = {
@@ -18,15 +22,17 @@ export const BASE_MODEL_CATALOG: Record<BaseModelId, BaseModelCatalogItem> = {
     id: 'gemini-4-hydrogen',
     displayName: 'Gemini 4 Hydrogen',
     capability: 'text',
-    description: 'Универсальная высокопроизводительная языковая модель с настройкой глубины рассуждений.',
+    description: 'Универсальная облачная языковая модель с настройкой глубины рассуждений.',
     supportsThinking: true,
+    provider: 'cloud_gemini',
   },
   'gemini-3.1-flash-lite': {
     id: 'gemini-3.1-flash-lite',
     displayName: 'Gemini 3.1 Flash Lite',
     capability: 'text',
-    description: 'Облегчённая сверхбыстрая модель для задач с минимальной задержкой первого токена.',
+    description: 'Облегчённая сверхбыстрая облачная модель для задач с минимальной задержкой первого токена.',
     supportsThinking: false,
+    provider: 'cloud_gemini',
   },
   'gemini-embedding-2': {
     id: 'gemini-embedding-2',
@@ -34,16 +40,140 @@ export const BASE_MODEL_CATALOG: Record<BaseModelId, BaseModelCatalogItem> = {
     capability: 'embedding',
     description: 'Модель генерации векторных представлений текста для эндпоинта /v1/embeddings.',
     supportsThinking: false,
+    provider: 'cloud_gemini',
+  },
+  'local-gguf': {
+    id: 'local-gguf',
+    displayName: 'Локальная GGUF (CPU / GPU)',
+    capability: 'text',
+    description: 'Локальный инференс квантованных GGUF-моделей через llama.cpp на CPU и/или GPU.',
+    supportsThinking: false,
+    provider: 'local_gguf',
   },
 } as const;
 
 export type ThinkingLevelOption = 'LOW' | 'MEDIUM' | 'HIGH';
 export type DeploymentStatus = 'running' | 'stopped' | 'starting' | 'error';
 
+export interface GpuDeviceInfo {
+  index: number;
+  name: string;
+  vendor: 'nvidia' | 'apple' | 'amd' | 'unknown';
+  vramTotalBytes: number;
+  vramFreeBytes: number;
+  driverVersion: string | null;
+}
+
+export interface HardwareProfile {
+  hostname: string;
+  osPlatform: string;
+  osRelease: string;
+  arch: string;
+  cpuModel: string;
+  cpuCores: number;
+  cpuThreads: number;
+  totalRamBytes: number;
+  freeRamBytes: number;
+  unifiedMemory: boolean;
+  gpus: GpuDeviceInfo[];
+  totalVramBytes: number;
+  freeVramBytes: number;
+  diskFreeBytes: number;
+  diskTotalBytes: number;
+  modelsDir: string;
+  binDir: string;
+  llamaServerPath: string | null;
+  llamaServerAvailable: boolean;
+  llamaServerVersion: string | null;
+  detectedAtMs: number;
+}
+
+export type CompatibilityVerdict = 'gpu_full' | 'gpu_partial' | 'cpu_only' | 'insufficient';
+
+export interface CompatibilityAssessment {
+  verdict: CompatibilityVerdict;
+  label: string;
+  summary: string;
+  modelSizeBytes: number;
+  estimatedKvCacheBytes: number;
+  runtimeOverheadBytes: number;
+  requiredMemoryBytes: number;
+  availableVramBytes: number;
+  availableRamBytes: number;
+  totalEstimatedLayers: number;
+  recommendedGpuLayers: number;
+  fitsInVram: boolean;
+  fitsInRam: boolean;
+  fitsOnDisk: boolean;
+}
+
+export type HubSource = 'huggingface' | 'ollama' | 'modelscope' | 'url';
+
+export interface HubSearchResult {
+  id: string;
+  source: HubSource;
+  name: string;
+  author: string;
+  description: string;
+  downloads?: number;
+  likes?: number;
+  tags?: string[];
+  updatedAt?: string;
+}
+
+export interface HubGgufFile {
+  fileName: string;
+  path: string;
+  sizeBytes: number | null;
+  quantization: string;
+  downloadUrl: string;
+  sha256?: string;
+  compatibility?: CompatibilityAssessment | null;
+}
+
+export type DownloadStatus =
+  | 'queued'
+  | 'downloading'
+  | 'paused'
+  | 'completed'
+  | 'error'
+  | 'cancelled';
+
+export interface ModelDownloadJob {
+  id: string;
+  source: HubSource;
+  repoId: string;
+  fileName: string;
+  downloadUrl: string;
+  targetPath: string;
+  quantization: string;
+  status: DownloadStatus;
+  bytesDownloaded: number;
+  totalBytes: number;
+  speedBytesPerSec: number;
+  etaSeconds: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+  errorMessage: string | null;
+}
+
+export interface LocalGgufModel {
+  id: string;
+  fileName: string;
+  filePath: string;
+  sizeBytes: number;
+  quantization: string;
+  source: HubSource | 'local';
+  repoId: string;
+  modifiedAtMs: number;
+  compatibility: CompatibilityAssessment;
+}
+
 export interface ModelDeployment {
   id: string;
   alias: string;
   baseModel: BaseModelId;
+  provider: DeploymentProvider;
   capability: ModelCapability;
   status: DeploymentStatus;
   thinkingLevel: ThinkingLevelOption;
@@ -56,6 +186,16 @@ export interface ModelDeployment {
   totalErrors: number;
   startedAtMs: number | null;
   lastError: string | null;
+  ggufPath?: string;
+  ggufFileName?: string;
+  ggufSizeBytes?: number;
+  deviceMode?: GgufDeviceMode;
+  gpuLayers?: number;
+  cpuThreads?: number;
+  ctxSize?: number;
+  localPort?: number | null;
+  pid?: number | null;
+  compatibility?: CompatibilityAssessment | null;
 }
 
 export type RequestStatus = 'queued' | 'running' | 'completed' | 'error';
@@ -141,4 +281,7 @@ export interface ServerSnapshot {
   avgTpotMs: number | null;
   avgThroughputTokPerSec: number | null;
   pagedAttention: PagedAttentionSnapshot;
+  hardware: HardwareProfile;
+  localModels: LocalGgufModel[];
+  downloads: ModelDownloadJob[];
 }

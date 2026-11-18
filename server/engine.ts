@@ -1,7 +1,13 @@
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import {
   BASE_MODEL_CATALOG,
   type BaseModelId,
+  type GgufDeviceMode,
+  type HardwareProfile,
+  type LocalGgufModel,
   type ModelDeployment,
   type PagedAttentionSnapshot,
   type PagedBlock,
@@ -9,7 +15,10 @@ import {
   type ServerSnapshot,
   type ThinkingLevelOption,
 } from '../src/types/engine.ts';
+import { downloadManager } from './downloader.ts';
 import { isGeminiApiKeyConfigured, probeModelReadiness } from './gemini.ts';
+import { startGgufProcess, stopAllGgufProcesses, stopGgufProcess } from './ggufRunner.ts';
+import { assessModelCompatibility, detectHardwareProfile } from './hardware.ts';
 
 type Listener = (snapshot: ServerSnapshot) => void;
 
@@ -62,9 +71,56 @@ export class ModelServerRuntime {
   private prefixBlockIndex = new Map<string, number>();
   private lastStreamBroadcastAt = 0;
 
+  // Real hardware profile and local GGUF models cache
+  private hardwareProfile: HardwareProfile = {
+    hostname: os.hostname(),
+    osPlatform: os.platform(),
+    osRelease: os.release(),
+    arch: os.arch(),
+    cpuModel: os.cpus()[0]?.model?.trim() || `${os.arch()} CPU`,
+    cpuCores: Math.max(1, Math.floor(os.cpus().length / 2) || os.cpus().length),
+    cpuThreads: Math.max(1, os.cpus().length),
+    totalRamBytes: os.totalmem(),
+    freeRamBytes: os.freemem(),
+    unifiedMemory: false,
+    gpus: [],
+    totalVramBytes: 0,
+    freeVramBytes: 0,
+    diskFreeBytes: 0,
+    diskTotalBytes: 0,
+    modelsDir: '',
+    binDir: '',
+    llamaServerPath: null,
+    llamaServerAvailable: false,
+    llamaServerVersion: null,
+    detectedAtMs: Date.now(),
+  };
+  private localModelsCache: LocalGgufModel[] = [];
+
   constructor() {
     this.seedInitialDeployments();
     this.initPagedPool();
+    downloadManager.subscribe(() => {
+      void this.refreshLocalModels();
+      this.broadcast();
+    });
+    void this.refreshHardwareAndModels(true);
+  }
+
+  public async refreshHardwareAndModels(forceHardware = false): Promise<ServerSnapshot> {
+    this.hardwareProfile = await detectHardwareProfile(forceHardware);
+    this.localModelsCache = await downloadManager.getLocalModels(this.maxModelLen);
+    this.broadcast();
+    return this.getSnapshot();
+  }
+
+  public async refreshLocalModels(): Promise<void> {
+    this.localModelsCache = await downloadManager.getLocalModels(this.maxModelLen);
+    this.broadcast();
+  }
+
+  public shutdown(): void {
+    stopAllGgufProcesses();
   }
 
   private initPagedPool(): void {
@@ -88,6 +144,7 @@ export class ModelServerRuntime {
         id: 'dep-hydrogen',
         alias: 'hydrogen-chat',
         baseModel: 'gemini-4-hydrogen',
+        provider: 'cloud_gemini',
         capability: 'text',
         status: 'running',
         thinkingLevel: 'LOW',
@@ -105,6 +162,7 @@ export class ModelServerRuntime {
         id: 'dep-flash-lite',
         alias: 'flash-lite-fast',
         baseModel: 'gemini-3.1-flash-lite',
+        provider: 'cloud_gemini',
         capability: 'text',
         status: 'stopped',
         thinkingLevel: 'LOW',
@@ -122,6 +180,7 @@ export class ModelServerRuntime {
         id: 'dep-embedding',
         alias: 'text-embedding-v2',
         baseModel: 'gemini-embedding-2',
+        provider: 'cloud_gemini',
         capability: 'embedding',
         status: 'stopped',
         thinkingLevel: 'LOW',
@@ -173,6 +232,7 @@ export class ModelServerRuntime {
     }
     if (typeof patch.maxModelLen === 'number') {
       this.maxModelLen = Math.min(8192, Math.max(512, Math.round(patch.maxModelLen)));
+      void this.refreshLocalModels();
     }
     if (typeof patch.enablePrefixCaching === 'boolean') {
       this.enablePrefixCaching = patch.enablePrefixCaching;
@@ -398,6 +458,11 @@ export class ModelServerRuntime {
     maxConcurrentRequests?: number;
     enableResponseCache?: boolean;
     verifyOnLaunch?: boolean;
+    ggufPath?: string;
+    deviceMode?: GgufDeviceMode;
+    gpuLayers?: number;
+    cpuThreads?: number;
+    ctxSize?: number;
   }): Promise<ModelDeployment> {
     const cleanAlias = input.alias.trim();
     if (!cleanAlias) {
@@ -412,11 +477,37 @@ export class ModelServerRuntime {
       throw new Error(`Неизвестная базовая модель: ${input.baseModel}`);
     }
 
+    const isGguf = input.baseModel === 'local-gguf';
+    let ggufPath: string | undefined;
+    let ggufFileName: string | undefined;
+    let ggufSizeBytes: number | undefined;
+    let compatibility = null;
+
+    if (isGguf) {
+      ggufPath = input.ggufPath?.trim();
+      if (!ggufPath || !fs.existsSync(ggufPath)) {
+        throw new Error('Выберите загруженный локальный GGUF-файл модели.');
+      }
+      ggufFileName = path.basename(ggufPath);
+      ggufSizeBytes = fs.statSync(ggufPath).size;
+      const hw = await detectHardwareProfile();
+      compatibility = assessModelCompatibility(hw, ggufSizeBytes, input.ctxSize ?? this.maxModelLen);
+    }
+
     const id = `dep-${this.depCounter++}`;
+    const resolvedDeviceMode: GgufDeviceMode = input.deviceMode ?? 'auto';
+    const resolvedGpuLayers =
+      typeof input.gpuLayers === 'number'
+        ? input.gpuLayers
+        : resolvedDeviceMode === 'cpu'
+        ? 0
+        : compatibility?.recommendedGpuLayers ?? 0;
+
     const deployment: ModelDeployment = {
       id,
       alias: cleanAlias,
       baseModel: input.baseModel,
+      provider: catalogItem.provider,
       capability: catalogItem.capability,
       status: 'starting',
       thinkingLevel: input.thinkingLevel ?? 'LOW',
@@ -429,13 +520,47 @@ export class ModelServerRuntime {
       totalErrors: 0,
       startedAtMs: null,
       lastError: null,
+      ...(isGguf
+        ? {
+            ggufPath,
+            ggufFileName,
+            ggufSizeBytes,
+            deviceMode: resolvedDeviceMode,
+            gpuLayers: resolvedGpuLayers,
+            cpuThreads: Math.max(1, input.cpuThreads ?? Math.max(2, this.hardwareProfile.cpuThreads - 1)),
+            ctxSize: Math.max(512, input.ctxSize ?? this.maxModelLen),
+            localPort: null,
+            pid: null,
+            compatibility,
+          }
+        : {}),
     };
 
     this.deployments.set(id, deployment);
     this.waitQueues.set(id, []);
     this.broadcast();
 
-    if (input.verifyOnLaunch !== false) {
+    if (isGguf && ggufPath) {
+      try {
+        const proc = await startGgufProcess({
+          deploymentId: id,
+          ggufPath,
+          deviceMode: resolvedDeviceMode,
+          gpuLayers: resolvedGpuLayers,
+          cpuThreads: deployment.cpuThreads ?? 4,
+          ctxSize: deployment.ctxSize ?? this.maxModelLen,
+          parallelSlots: deployment.maxConcurrentRequests,
+        });
+        deployment.status = 'running';
+        deployment.startedAtMs = Date.now();
+        deployment.localPort = proc.port;
+        deployment.pid = proc.pid;
+        deployment.lastError = null;
+      } catch (err) {
+        deployment.status = 'error';
+        deployment.lastError = err instanceof Error ? err.message : String(err);
+      }
+    } else if (input.verifyOnLaunch !== false) {
       try {
         await probeModelReadiness(deployment.baseModel);
         deployment.status = 'running';
@@ -463,7 +588,28 @@ export class ModelServerRuntime {
     dep.lastError = null;
     this.broadcast();
 
-    if (verify) {
+    if (dep.provider === 'local_gguf') {
+      try {
+        if (!dep.ggufPath) throw new Error('Не указан путь к GGUF-файлу.');
+        const proc = await startGgufProcess({
+          deploymentId: dep.id,
+          ggufPath: dep.ggufPath,
+          deviceMode: dep.deviceMode ?? 'auto',
+          gpuLayers: dep.gpuLayers ?? 0,
+          cpuThreads: dep.cpuThreads ?? 4,
+          ctxSize: dep.ctxSize ?? this.maxModelLen,
+          parallelSlots: dep.maxConcurrentRequests,
+        });
+        dep.status = 'running';
+        dep.startedAtMs = Date.now();
+        dep.localPort = proc.port;
+        dep.pid = proc.pid;
+        dep.lastError = null;
+      } catch (err) {
+        dep.status = 'error';
+        dep.lastError = err instanceof Error ? err.message : String(err);
+      }
+    } else if (verify) {
       try {
         await probeModelReadiness(dep.baseModel);
         dep.status = 'running';
@@ -482,10 +628,15 @@ export class ModelServerRuntime {
     return { ...dep };
   }
 
-  public stopDeployment(id: string): ModelDeployment {
+  public async stopDeployment(id: string): Promise<ModelDeployment> {
     const dep = this.deployments.get(id);
     if (!dep) {
       throw new Error('Развёртывание модели не найдено.');
+    }
+    if (dep.provider === 'local_gguf') {
+      await stopGgufProcess(dep.id);
+      dep.localPort = null;
+      dep.pid = null;
     }
     dep.status = 'stopped';
     dep.startedAtMs = null;
@@ -498,7 +649,14 @@ export class ModelServerRuntime {
     patch: Partial<
       Pick<
         ModelDeployment,
-        'thinkingLevel' | 'systemInstruction' | 'maxConcurrentRequests' | 'enableResponseCache'
+        | 'thinkingLevel'
+        | 'systemInstruction'
+        | 'maxConcurrentRequests'
+        | 'enableResponseCache'
+        | 'deviceMode'
+        | 'gpuLayers'
+        | 'cpuThreads'
+        | 'ctxSize'
       >
     >
   ): ModelDeployment {
@@ -517,15 +675,22 @@ export class ModelServerRuntime {
     if (typeof patch.enableResponseCache === 'boolean') {
       dep.enableResponseCache = patch.enableResponseCache;
     }
+    if (patch.deviceMode) dep.deviceMode = patch.deviceMode;
+    if (typeof patch.gpuLayers === 'number') dep.gpuLayers = patch.gpuLayers;
+    if (typeof patch.cpuThreads === 'number') dep.cpuThreads = Math.max(1, patch.cpuThreads);
+    if (typeof patch.ctxSize === 'number') dep.ctxSize = Math.max(512, patch.ctxSize);
     this.broadcast();
     return { ...dep };
   }
 
-  public deleteDeployment(id: string): void {
+  public async deleteDeployment(id: string): Promise<void> {
     const dep = this.deployments.get(id);
     if (!dep) return;
     if (dep.activeRequests > 0) {
       throw new Error('Нельзя удалить модель, пока выполняются активные запросы.');
+    }
+    if (dep.provider === 'local_gguf') {
+      await stopGgufProcess(dep.id);
     }
     this.deployments.delete(id);
     this.waitQueues.delete(id);
@@ -700,6 +865,7 @@ export class ModelServerRuntime {
     const serialized = JSON.stringify({
       alias: deployment.alias,
       baseModel: deployment.baseModel,
+      ggufPath: deployment.ggufPath ?? null,
       thinkingLevel: deployment.thinkingLevel,
       systemInstruction: deployment.systemInstruction,
       payload,
@@ -924,6 +1090,9 @@ export class ModelServerRuntime {
       avgTpotMs,
       avgThroughputTokPerSec,
       pagedAttention: this.buildPagedSnapshot(),
+      hardware: this.hardwareProfile,
+      localModels: this.localModelsCache,
+      downloads: downloadManager.getJobs(),
     };
   }
 

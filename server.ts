@@ -1,7 +1,15 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import {
+  downloadManager,
+  installLlamaServerRuntime,
+  listHubGgufFiles,
+  probeDirectGgufUrl,
+  searchHubModels,
+} from './server/downloader.ts';
 import { modelServer } from './server/engine.ts';
 import {
   formatGeminiError,
@@ -10,10 +18,30 @@ import {
   streamGeminiText,
   type OpenAiChatMessage,
 } from './server/gemini.ts';
+import { generateGgufChat, streamGgufChat } from './server/ggufRunner.ts';
+import { assessModelCompatibility, detectHardwareProfile } from './server/hardware.ts';
+import type { HubSource } from './src/types/engine.ts';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const PORT = 3000;
+const __filename = typeof import.meta?.url === 'string' ? fileURLToPath(import.meta.url) : '';
+const __dirname = __filename ? path.dirname(__filename) : process.cwd();
+const PORT = Number(process.env.PORT) || 3000;
+
+function resolvePublicDistDir(): string {
+  const candidates = [
+    process.env.VLLM_DIST_DIR,
+    path.resolve(__dirname, 'dist'),
+    path.resolve(__dirname, '..', 'dist'),
+    path.resolve(path.dirname(process.execPath), 'dist'),
+    path.resolve(process.cwd(), 'dist'),
+  ].filter((p): p is string => Boolean(p));
+
+  for (const dir of candidates) {
+    if (fs.existsSync(path.join(dir, 'index.html'))) {
+      return dir;
+    }
+  }
+  return path.resolve(process.cwd(), 'dist');
+}
 
 async function startServer() {
   const app = express();
@@ -195,12 +223,23 @@ async function startServer() {
         let completionTokens = 0;
         let totalTokens = 0;
 
-        for await (const chunk of streamGeminiText({
-          baseModel: textModel,
-          messages,
-          defaultSystemInstruction: deployment.systemInstruction,
-          thinkingLevel: deployment.thinkingLevel,
-        })) {
+        const tokenStream =
+          deployment.provider === 'local_gguf'
+            ? streamGgufChat({
+                deploymentId: deployment.id,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+              })
+            : streamGeminiText({
+                baseModel: textModel,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                thinkingLevel: deployment.thinkingLevel,
+              });
+
+        for await (const chunk of tokenStream) {
           if (chunk.text) {
             if (ttftMs === null) {
               ttftMs = performance.now() - startedAt;
@@ -266,12 +305,21 @@ async function startServer() {
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
-        const result = await generateGeminiText({
-          baseModel: textModel,
-          messages,
-          defaultSystemInstruction: deployment.systemInstruction,
-          thinkingLevel: deployment.thinkingLevel,
-        });
+        const result =
+          deployment.provider === 'local_gguf'
+            ? await generateGgufChat({
+                deploymentId: deployment.id,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+              })
+            : await generateGeminiText({
+                baseModel: textModel,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                thinkingLevel: deployment.thinkingLevel,
+              });
         const totalDurationMs = performance.now() - startedAt;
         const promptTokens = result.usage.promptTokens;
         const completionTokens =
@@ -440,12 +488,23 @@ async function startServer() {
         let completionTokens = 0;
         let totalTokens = 0;
 
-        for await (const chunk of streamGeminiText({
-          baseModel: textModel,
-          messages,
-          defaultSystemInstruction: deployment.systemInstruction,
-          thinkingLevel: deployment.thinkingLevel,
-        })) {
+        const compStream =
+          deployment.provider === 'local_gguf'
+            ? streamGgufChat({
+                deploymentId: deployment.id,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+              })
+            : streamGeminiText({
+                baseModel: textModel,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                thinkingLevel: deployment.thinkingLevel,
+              });
+
+        for await (const chunk of compStream) {
           if (chunk.text) {
             if (ttftMs === null) ttftMs = performance.now() - startedAt;
             fullText += chunk.text;
@@ -505,12 +564,21 @@ async function startServer() {
         res.write('data: [DONE]\n\n');
         res.end();
       } else {
-        const result = await generateGeminiText({
-          baseModel: textModel,
-          messages,
-          defaultSystemInstruction: deployment.systemInstruction,
-          thinkingLevel: deployment.thinkingLevel,
-        });
+        const result =
+          deployment.provider === 'local_gguf'
+            ? await generateGgufChat({
+                deploymentId: deployment.id,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
+                maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+              })
+            : await generateGeminiText({
+                baseModel: textModel,
+                messages,
+                defaultSystemInstruction: deployment.systemInstruction,
+                thinkingLevel: deployment.thinkingLevel,
+              });
         const totalDurationMs = performance.now() - startedAt;
         const promptTokens = result.usage.promptTokens;
         const completionTokens =
@@ -683,9 +751,9 @@ async function startServer() {
     }
   });
 
-  app.post('/api/deployments/:id/stop', (req, res) => {
+  app.post('/api/deployments/:id/stop', async (req, res) => {
     try {
-      const dep = modelServer.stopDeployment(req.params.id);
+      const dep = await modelServer.stopDeployment(req.params.id);
       res.json({ deployment: dep, snapshot: modelServer.getSnapshot() });
     } catch (err) {
       res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
@@ -701,9 +769,9 @@ async function startServer() {
     }
   });
 
-  app.delete('/api/deployments/:id', (req, res) => {
+  app.delete('/api/deployments/:id', async (req, res) => {
     try {
-      modelServer.deleteDeployment(req.params.id);
+      await modelServer.deleteDeployment(req.params.id);
       res.json({ snapshot: modelServer.getSnapshot() });
     } catch (err) {
       res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
@@ -733,10 +801,152 @@ async function startServer() {
   });
 
   // =========================================================================
-  // Vite Middleware (Dev) or Static Dist (Prod)
+  // Real PC Hardware Profiler & GGUF Compatibility Endpoints
+  // =========================================================================
+  app.get('/api/hardware', async (req, res) => {
+    try {
+      const force = req.query.refresh === '1' || req.query.refresh === 'true';
+      const snapshot = await modelServer.refreshHardwareAndModels(force);
+      res.json({ hardware: snapshot.hardware, snapshot });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/hardware/assess', async (req, res) => {
+    try {
+      const sizeBytes = Number(req.body?.sizeBytes);
+      const ctxLen = Number(req.body?.ctxSize ?? 2048);
+      if (!Number.isFinite(sizeBytes) || sizeBytes <= 0) {
+        res.status(400).json({ error: 'Укажите корректный размер модели в байтах.' });
+        return;
+      }
+      const hw = await detectHardwareProfile();
+      res.json(assessModelCompatibility(hw, sizeBytes, ctxLen));
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  // =========================================================================
+  // Multi-Source Model Hub Search & Resumable GGUF Downloader
+  // =========================================================================
+  app.get('/api/hub/search', async (req, res) => {
+    try {
+      const source = (String(req.query.source ?? 'huggingface') as HubSource);
+      const query = String(req.query.q ?? '');
+      const results = await searchHubModels(source, query);
+      res.json({ results });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/hub/files', async (req, res) => {
+    try {
+      const source = (String(req.query.source ?? 'huggingface') as HubSource);
+      const repo = String(req.query.repo ?? '');
+      const ctxSize = Number(req.query.ctxSize ?? 2048);
+      const files = await listHubGgufFiles(source, repo, ctxSize);
+      res.json({ files });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/hub/probe-url', async (req, res) => {
+    try {
+      const targetUrl = String(req.query.url ?? '');
+      const ctxSize = Number(req.query.ctxSize ?? 2048);
+      const file = await probeDirectGgufUrl(targetUrl, ctxSize);
+      res.json({ file });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/gguf/local', async (_req, res) => {
+    try {
+      await modelServer.refreshLocalModels();
+      res.json({ localModels: modelServer.getSnapshot().localModels });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/gguf/local/:id', async (req, res) => {
+    try {
+      downloadManager.deleteLocalModel(req.params.id);
+      await modelServer.refreshLocalModels();
+      res.json({ snapshot: modelServer.getSnapshot() });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/gguf/install-runtime', async (_req, res) => {
+    try {
+      const result = await installLlamaServerRuntime();
+      const snapshot = await modelServer.refreshHardwareAndModels(true);
+      res.json({ ...result, snapshot });
+    } catch (err) {
+      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.get('/api/downloads', (_req, res) => {
+    res.json({ downloads: downloadManager.getJobs() });
+  });
+
+  app.post('/api/downloads', (req, res) => {
+    try {
+      const body = req.body ?? {};
+      if (!body.downloadUrl || !body.fileName) {
+        res.status(400).json({ error: 'Необходимо указать downloadUrl и fileName.' });
+        return;
+      }
+      const job = downloadManager.startDownload({
+        source: (body.source as HubSource) ?? 'url',
+        repoId: String(body.repoId ?? body.fileName),
+        fileName: String(body.fileName),
+        downloadUrl: String(body.downloadUrl),
+        totalBytes: typeof body.totalBytes === 'number' ? body.totalBytes : null,
+        quantization: typeof body.quantization === 'string' ? body.quantization : undefined,
+      });
+      res.status(201).json({ job, snapshot: modelServer.getSnapshot() });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/downloads/:id/pause', (req, res) => {
+    try {
+      const job = downloadManager.pauseDownload(req.params.id);
+      res.json({ job, snapshot: modelServer.getSnapshot() });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/downloads/:id/resume', (req, res) => {
+    try {
+      const job = downloadManager.resumeDownload(req.params.id);
+      res.json({ job, snapshot: modelServer.getSnapshot() });
+    } catch (err) {
+      res.status(404).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.delete('/api/downloads/:id', (req, res) => {
+    downloadManager.cancelDownload(req.params.id);
+    res.json({ snapshot: modelServer.getSnapshot() });
+  });
+
+  // =========================================================================
+  // Vite Middleware (Dev) or Static Dist (Prod / Standalone Binary)
   // =========================================================================
   if (process.env.NODE_ENV === 'production') {
-    const distDir = path.resolve(__dirname, 'dist');
+    const distDir = resolvePublicDistDir();
     app.use(express.static(distDir));
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
@@ -750,9 +960,16 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`vLLM Gateway Server listening on http://0.0.0.0:${PORT}`);
   });
+
+  const handleSignal = () => {
+    modelServer.shutdown();
+    server.close(() => process.exit(0));
+  };
+  process.on('SIGINT', handleSignal);
+  process.on('SIGTERM', handleSignal);
 }
 
 startServer().catch((err) => {

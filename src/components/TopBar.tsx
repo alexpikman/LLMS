@@ -1,7 +1,13 @@
 import React from 'react';
 import { Plus } from 'lucide-react';
 
-export type WorkspaceViewId = 'models' | 'chat' | 'paged_blocks' | 'openai_api' | 'benchmarks';
+export type WorkspaceViewId =
+  | 'models'
+  | 'gguf_hub'
+  | 'chat'
+  | 'paged_blocks'
+  | 'openai_api'
+  | 'benchmarks';
 
 interface TopBarProps {
   activeView: WorkspaceViewId;
@@ -11,10 +17,11 @@ interface TopBarProps {
 
 const NAV_ITEMS: Array<{ id: WorkspaceViewId; label: string }> = [
   { id: 'models', label: 'Модели и запуск' },
+  { id: 'gguf_hub', label: 'Центр GGUF' },
   { id: 'chat', label: 'Чат с моделью' },
   { id: 'paged_blocks', label: 'Блоки PagedAttention' },
   { id: 'openai_api', label: 'OpenAI API' },
-  { id: 'benchmarks', label: 'Реальный бенчмарк' },
+  { id: 'benchmarks', label: 'Бенчмарк' },
 ];
 
 export const TopBar: React.FC<TopBarProps> = ({

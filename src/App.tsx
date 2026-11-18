@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { GgufHubView } from './components/GgufHubView';
 import { GpuContextController } from './components/GpuContextController';
 import { ModelChatView } from './components/ModelChatView';
 import { ModelsManagerView } from './components/ModelsManagerView';
@@ -7,13 +8,14 @@ import { PagedAttentionGrid } from './components/PagedAttentionGrid';
 import { RealBenchmarkView } from './components/RealBenchmarkView';
 import { TelemetryStrip } from './components/TelemetryStrip';
 import { TopBar, type WorkspaceViewId } from './components/TopBar';
-import type { ServerSnapshot } from './types/engine';
+import type { LocalGgufModel, ServerSnapshot } from './types/engine';
 
 export default function App() {
   const [snapshot, setSnapshot] = useState<ServerSnapshot | null>(null);
   const [activeView, setActiveView] = useState<WorkspaceViewId>('models');
   const [showLaunchForm, setShowLaunchForm] = useState<boolean>(false);
   const [preferredChatAlias, setPreferredChatAlias] = useState<string | null>(null);
+  const [preselectedGguf, setPreselectedGguf] = useState<LocalGgufModel | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -98,12 +100,27 @@ export default function App() {
             <ModelsManagerView
               snapshot={snapshot}
               showLaunchForm={showLaunchForm}
+              preselectedGguf={preselectedGguf}
+              onClearPreselectedGguf={() => setPreselectedGguf(null)}
               onCloseLaunchForm={() => setShowLaunchForm(false)}
               onOpenLaunchForm={() => setShowLaunchForm(true)}
+              onGoToGgufHub={() => setActiveView('gguf_hub')}
               onRefreshSnapshot={setSnapshot}
               onUseModelInChat={(alias) => {
                 setPreferredChatAlias(alias);
                 setActiveView('chat');
+              }}
+            />
+          )}
+
+          {activeView === 'gguf_hub' && (
+            <GgufHubView
+              snapshot={snapshot}
+              onRefreshSnapshot={setSnapshot}
+              onLaunchLocalModel={(model) => {
+                setPreselectedGguf(model);
+                setShowLaunchForm(true);
+                setActiveView('models');
               }}
             />
           )}

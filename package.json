@@ -7,8 +7,10 @@
     "dev": "tsx server.ts",
     "start": "node server.ts",
     "build": "vite build",
+    "build:server": "node scripts/build-release.mjs --bundle-only",
+    "build:release": "node scripts/build-release.mjs --sea",
     "preview": "vite preview",
-    "clean": "rm -rf dist server.js",
+    "clean": "rm -rf dist dist-server release-build server.js",
     "lint": "tsc --noEmit"
   },
   "dependencies": {

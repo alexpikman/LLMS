@@ -1,18 +1,25 @@
-import React, { useState } from 'react';
-import { MessageSquare, Play, Square, Trash2, X } from 'lucide-react';
+import React, { useEffect, useState } from 'react';
+import { HardDriveDownload, MessageSquare, Play, Square, Trash2, X } from 'lucide-react';
 import {
   BASE_MODEL_CATALOG,
   type BaseModelId,
+  type GgufDeviceMode,
+  type LocalGgufModel,
   type ModelDeployment,
   type ServerSnapshot,
   type ThinkingLevelOption,
 } from '../types/engine';
+import { CompatibilityBadge, formatBytes } from './CompatibilityBadge';
+import { HardwareSummaryBanner } from './HardwareSummaryBanner';
 
 interface ModelsManagerViewProps {
   snapshot: ServerSnapshot;
   showLaunchForm: boolean;
+  preselectedGguf: LocalGgufModel | null;
+  onClearPreselectedGguf: () => void;
   onCloseLaunchForm: () => void;
   onOpenLaunchForm: () => void;
+  onGoToGgufHub: () => void;
   onRefreshSnapshot: (snapshot: ServerSnapshot) => void;
   onUseModelInChat: (alias: string) => void;
 }
@@ -30,8 +37,11 @@ const STATUS_META: Record<
 export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
   snapshot,
   showLaunchForm,
+  preselectedGguf,
+  onClearPreselectedGguf,
   onCloseLaunchForm,
   onOpenLaunchForm,
+  onGoToGgufHub,
   onRefreshSnapshot,
   onUseModelInChat,
 }) => {
@@ -41,9 +51,37 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
   const [systemInstruction, setSystemInstruction] = useState('');
   const [maxConcurrency, setMaxConcurrency] = useState(4);
   const [enableCache, setEnableCache] = useState(true);
+  const [ggufPath, setGgufPath] = useState('');
+  const [deviceMode, setDeviceMode] = useState<GgufDeviceMode>('auto');
+  const [gpuLayers, setGpuLayers] = useState(0);
+  const [cpuThreads, setCpuThreads] = useState(Math.max(2, snapshot.hardware.cpuThreads - 1));
+  const [ctxSize, setCtxSize] = useState(snapshot.pagedAttention.maxModelLen);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyDeploymentId, setBusyDeploymentId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (preselectedGguf) {
+      setBaseModel('local-gguf');
+      setGgufPath(preselectedGguf.filePath);
+      const cleanName = preselectedGguf.fileName.replace(/\.gguf$/i, '').toLowerCase();
+      setAlias(cleanName);
+      if (preselectedGguf.compatibility.verdict === 'gpu_full') {
+        setDeviceMode('gpu');
+        setGpuLayers(preselectedGguf.compatibility.totalEstimatedLayers);
+      } else if (preselectedGguf.compatibility.verdict === 'gpu_partial') {
+        setDeviceMode('auto');
+        setGpuLayers(preselectedGguf.compatibility.recommendedGpuLayers);
+      } else {
+        setDeviceMode('cpu');
+        setGpuLayers(0);
+      }
+      onClearPreselectedGguf();
+    }
+  }, [preselectedGguf, onClearPreselectedGguf]);
+
+  const selectedLocalModel =
+    snapshot.localModels.find((m) => m.filePath === ggufPath) ?? snapshot.localModels[0] ?? null;
 
   const handleLaunchNew = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -51,6 +89,7 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
     setIsSubmitting(true);
     setActionError(null);
     try {
+      const targetGgufPath = baseModel === 'local-gguf' ? ggufPath || selectedLocalModel?.filePath : undefined;
       const res = await fetch('/api/deployments', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -62,6 +101,15 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
           maxConcurrentRequests: maxConcurrency,
           enableResponseCache: enableCache,
           verifyOnLaunch: true,
+          ...(baseModel === 'local-gguf'
+            ? {
+                ggufPath: targetGgufPath,
+                deviceMode,
+                gpuLayers: deviceMode === 'cpu' ? 0 : gpuLayers,
+                cpuThreads,
+                ctxSize,
+              }
+            : {}),
         }),
       });
       const json = await res.json();
@@ -152,16 +200,32 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
           </p>
         </div>
 
-        {!showLaunchForm && (
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={onOpenLaunchForm}
-            className="px-3.5 py-2 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
+            onClick={onGoToGgufHub}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
           >
-            Новое развёртывание
+            <HardDriveDownload className="w-3.5 h-3.5" />
+            <span>Скачать GGUF-модель</span>
           </button>
-        )}
+
+          {!showLaunchForm && (
+            <button
+              type="button"
+              onClick={onOpenLaunchForm}
+              className="px-3.5 py-2 rounded-md text-xs font-medium bg-white border border-slate-300 text-slate-700 hover:bg-slate-50 transition-colors cursor-pointer"
+            >
+              Новое развёртывание
+            </button>
+          )}
+        </div>
       </div>
+
+      <HardwareSummaryBanner
+        hardware={snapshot.hardware}
+        onRefreshSnapshot={onRefreshSnapshot}
+      />
 
       {actionError && (
         <div className="p-3.5 rounded-md bg-rose-50 border border-rose-200 text-xs text-rose-700">
@@ -217,7 +281,14 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
               <select
                 id="new-base"
                 value={baseModel}
-                onChange={(e) => setBaseModel(e.target.value as BaseModelId)}
+                onChange={(e) => {
+                  const next = e.target.value as BaseModelId;
+                  setBaseModel(next);
+                  if (next === 'local-gguf' && !ggufPath && snapshot.localModels[0]) {
+                    setGgufPath(snapshot.localModels[0].filePath);
+                    setGpuLayers(snapshot.localModels[0].compatibility.recommendedGpuLayers);
+                  }
+                }}
                 className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs text-slate-900 focus:outline-none focus:border-blue-600"
               >
                 {Object.values(BASE_MODEL_CATALOG).map((item) => (
@@ -243,6 +314,135 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
               />
             </div>
           </div>
+
+          {baseModel === 'local-gguf' && (
+            <div className="bg-slate-50 border border-slate-200 rounded-md p-4 space-y-4">
+              {snapshot.localModels.length === 0 ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 text-xs">
+                  <span className="text-slate-600">
+                    Скачанных GGUF-файлов пока нет. Перейдите в «Центр GGUF», чтобы загрузить модель.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={onGoToGgufHub}
+                    className="px-3 py-1.5 rounded-md font-semibold bg-blue-600 text-white hover:bg-blue-700 cursor-pointer"
+                  >
+                    Открыть Центр GGUF
+                  </button>
+                </div>
+              ) : (
+                <>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4 items-end">
+                    <div>
+                      <label htmlFor="gguf-file" className="block text-xs font-medium text-slate-700 mb-1">
+                        Локальный файл модели (.gguf)
+                      </label>
+                      <select
+                        id="gguf-file"
+                        value={ggufPath || selectedLocalModel?.filePath || ''}
+                        onChange={(e) => {
+                          setGgufPath(e.target.value);
+                          const found = snapshot.localModels.find((m) => m.filePath === e.target.value);
+                          if (found) {
+                            setGpuLayers(found.compatibility.recommendedGpuLayers);
+                          }
+                        }}
+                        className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs font-mono text-slate-900"
+                      >
+                        {snapshot.localModels.map((m) => (
+                          <option key={m.id} value={m.filePath}>
+                            {m.fileName} ({formatBytes(m.sizeBytes)} · {m.quantization})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      {selectedLocalModel && (
+                        <CompatibilityBadge assessment={selectedLocalModel.compatibility} />
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                    <div>
+                      <label htmlFor="gguf-device" className="block text-xs font-medium text-slate-700 mb-1">
+                        Режим вычислений
+                      </label>
+                      <select
+                        id="gguf-device"
+                        value={deviceMode}
+                        onChange={(e) => {
+                          const mode = e.target.value as GgufDeviceMode;
+                          setDeviceMode(mode);
+                          if (mode === 'cpu') setGpuLayers(0);
+                          else if (mode === 'gpu' && selectedLocalModel) {
+                            setGpuLayers(selectedLocalModel.compatibility.totalEstimatedLayers);
+                          } else if (selectedLocalModel) {
+                            setGpuLayers(selectedLocalModel.compatibility.recommendedGpuLayers);
+                          }
+                        }}
+                        className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs text-slate-900"
+                      >
+                        <option value="auto">Auto (по ресурсам ПК)</option>
+                        <option value="gpu">GPU Offload (VRAM)</option>
+                        <option value="cpu">Только CPU (RAM)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label htmlFor="gguf-layers" className="block text-xs font-medium text-slate-700 mb-1">
+                        Слоёв на GPU (--n-gpu-layers)
+                      </label>
+                      <input
+                        id="gguf-layers"
+                        type="number"
+                        min={0}
+                        max={200}
+                        disabled={deviceMode === 'cpu'}
+                        value={deviceMode === 'cpu' ? 0 : gpuLayers}
+                        onChange={(e) => setGpuLayers(Number(e.target.value))}
+                        className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs font-mono text-slate-900 disabled:bg-slate-100"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="gguf-threads" className="block text-xs font-medium text-slate-700 mb-1">
+                        Потоки CPU (--threads)
+                      </label>
+                      <input
+                        id="gguf-threads"
+                        type="number"
+                        min={1}
+                        max={Math.max(1, snapshot.hardware.cpuThreads)}
+                        value={cpuThreads}
+                        onChange={(e) => setCpuThreads(Number(e.target.value))}
+                        className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs font-mono text-slate-900"
+                      />
+                    </div>
+
+                    <div>
+                      <label htmlFor="gguf-ctx" className="block text-xs font-medium text-slate-700 mb-1">
+                        Контекст (--ctx-size)
+                      </label>
+                      <select
+                        id="gguf-ctx"
+                        value={ctxSize}
+                        onChange={(e) => setCtxSize(Number(e.target.value))}
+                        className="w-full bg-white border border-slate-300 rounded-md px-3 py-2 text-xs font-mono text-slate-900"
+                      >
+                        {[1024, 2048, 4096, 8192].map((len) => (
+                          <option key={len} value={len}>
+                            {len} токенов
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
             <div className="md:col-span-2">
@@ -300,7 +500,7 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
             </button>
             <button
               type="submit"
-              disabled={isSubmitting || !alias.trim()}
+              disabled={isSubmitting || !alias.trim() || (baseModel === 'local-gguf' && !selectedLocalModel)}
               className="inline-flex items-center gap-1.5 px-4 py-2 rounded-md text-xs font-semibold bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 cursor-pointer"
             >
               <Play className="w-3.5 h-3.5 fill-current" />
@@ -328,7 +528,11 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
                     {dep.alias}
                   </span>
                   <span className="text-xs text-slate-500">·</span>
-                  <span className="text-xs font-mono text-slate-600">{dep.baseModel}</span>
+                  <span className="text-xs font-mono text-slate-600">
+                    {dep.provider === 'local_gguf'
+                      ? `${dep.ggufFileName ?? 'local-gguf'}`
+                      : dep.baseModel}
+                  </span>
                   <span className="text-xs text-slate-500">·</span>
                   <span className={`text-xs font-medium ${statusInfo.color}`}>
                     {statusInfo.label}
@@ -336,13 +540,26 @@ export const ModelsManagerView: React.FC<ModelsManagerViewProps> = ({
                 </div>
 
                 <p className="text-xs text-slate-600">
-                  {catalog.description}
+                  {dep.provider === 'local_gguf'
+                    ? `Локальный GGUF · ${formatBytes(dep.ggufSizeBytes)} · Режим: ${
+                        dep.deviceMode === 'cpu'
+                          ? 'Только CPU'
+                          : `GPU слоёв: ${dep.gpuLayers ?? 0}`
+                      } · Потоков CPU: ${dep.cpuThreads ?? 4} · Контекст: ${dep.ctxSize ?? 2048}`
+                    : catalog.description}
                 </p>
+
+                {dep.provider === 'local_gguf' && dep.compatibility && (
+                  <CompatibilityBadge assessment={dep.compatibility} compact />
+                )}
 
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] font-mono text-slate-500 pt-0.5">
                   <span>Активных: {dep.activeRequests}/{dep.maxConcurrentRequests}</span>
                   <span>В очереди: {dep.queuedRequests}</span>
                   <span>Обслужено: {dep.totalServed}</span>
+                  {dep.localPort && (
+                    <span>llama-server :{dep.localPort}</span>
+                  )}
                   {dep.totalErrors > 0 && (
                     <span className="text-rose-600">Ошибок: {dep.totalErrors}</span>
                   )}
