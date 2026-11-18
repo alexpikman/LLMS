@@ -48,7 +48,7 @@ export const ServerSettingsView: React.FC = () => {
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Не удалось изменить порт');
 
-      if (data.port === window.location.port || (data.port === 3003 && !window.location.port)) {
+      if (data.unchanged || Number(window.location.port || 3003) === data.port) {
         setMessage('Этот порт уже используется.');
         return;
       }
