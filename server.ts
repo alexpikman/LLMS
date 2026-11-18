@@ -960,8 +960,9 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`vLLM Gateway Server listening on http://0.0.0.0:${PORT}`);
+  const HOST = process.env.HOST || '127.0.0.1';
+  const server = app.listen(PORT, HOST, () => {
+    console.log(`vLLM Gateway Server listening on http://${HOST}:${PORT}`);
   });
 
   const handleSignal = () => {
