@@ -11,7 +11,8 @@ import {
   probeDirectGgufUrl,
   searchHubModels,
 } from './server/downloader.ts';
-import { modelServer } from './server/engine.ts';
+import { modelServer as defaultModelServer, type ModelServerRuntime } from './server/engine.ts';
+import { AuthManager, createAuthMiddleware, createRateLimiter } from './server/security.ts';
 import {
   formatGeminiError,
   generateGeminiEmbeddings,
@@ -46,9 +47,16 @@ function resolvePublicDistDir(): string {
   return path.resolve(process.cwd(), 'dist');
 }
 
-async function startServer() {
+export async function createGatewayApp(options: {
+  engine?: ModelServerRuntime;
+  authManager?: AuthManager;
+  enableVite?: boolean;
+} = {}) {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+  const modelServer = options.engine ?? defaultModelServer;
+  const authManager = options.authManager ?? new AuthManager();
+  app.locals.engine = modelServer;
 
   const HOST = process.env.HOST || '127.0.0.1';
   let currentPort = Number(process.env.PORT) || DEFAULT_PORT;
@@ -63,7 +71,52 @@ async function startServer() {
       // First run: use the default port.
     }
   }
-  let server: ReturnType<typeof app.listen>;
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', version: '0.1.0' });
+  });
+
+  app.get('/ready', (_req, res) => {
+    try {
+      fs.accessSync(PORT_CONFIG_DIR, fs.constants.W_OK);
+      res.json({ ready: true, dataDirWritable: true });
+    } catch {
+      res.status(503).json({ ready: false, dataDirWritable: false });
+    }
+  });
+
+  const authRateLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 10 });
+
+  app.get('/api/auth/status', (req, res) => {
+    res.json(authManager.getAuthStatus(req));
+  });
+
+  app.post('/api/auth/setup', authRateLimiter, (req, res) => {
+    try {
+      const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
+      const result = authManager.setupInitialToken(requestedToken);
+      authManager.setSessionCookieHeader(res);
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/auth/login', authRateLimiter, (req, res) => {
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (!authManager.verifyToken(token)) {
+      res.status(401).json({ error: 'Неверный API-токен.' });
+      return;
+    }
+    authManager.setSessionCookieHeader(res);
+    res.json({ authenticated: true });
+  });
+
+  app.post('/api/auth/logout', (_req, res) => {
+    authManager.clearSessionCookieHeader(res);
+    res.status(204).end();
+  });
+
+  app.use(['/api', '/v1'], createAuthMiddleware(authManager));
 
   app.get('/api/server/config', (_req, res) => {
     res.json({ host: HOST, port: currentPort, defaultPort: DEFAULT_PORT });
@@ -100,11 +153,11 @@ async function startServer() {
         return;
       }
 
-      const previousServer = server;
-      server = nextServer;
+      const previousServer = app.locals.server as ReturnType<typeof app.listen> | undefined;
+      app.locals.server = nextServer;
       currentPort = nextPort;
       res.json({ port: currentPort, unchanged: false });
-      res.once('finish', () => previousServer.close());
+      res.once('finish', () => previousServer?.close());
     });
   });
 
@@ -1006,34 +1059,57 @@ async function startServer() {
   // =========================================================================
   // Vite Middleware (Dev) or Static Dist (Prod / Standalone Binary)
   // =========================================================================
-  if (process.env.NODE_ENV === 'production') {
-    const distDir = resolvePublicDistDir();
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  if (options.enableVite !== false) {
+    if (process.env.NODE_ENV === 'production') {
+      const distDir = resolvePublicDistDir();
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
   }
 
-  server = app.listen(currentPort, HOST, () => {
-    console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
-  });
-
-  const handleSignal = () => {
-    modelServer.shutdown();
-    server.close(() => process.exit(0));
-  };
-  process.on('SIGINT', handleSignal);
-  process.on('SIGTERM', handleSignal);
+  return app;
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start vLLM Gateway Server:', err);
-  process.exit(1);
-});
+async function startServer() {
+  const app = await createGatewayApp();
+  const HOST = process.env.HOST || '127.0.0.1';
+  const savedPort = Number(process.env.PORT) || DEFAULT_PORT;
+  let currentPort = savedPort;
+  if (!process.env.PORT) {
+    try {
+      const savedConfig = JSON.parse(fs.readFileSync(PORT_CONFIG_PATH, 'utf8')) as { port?: number };
+      const candidate = Number(savedConfig.port);
+      if (Number.isInteger(candidate) && candidate >= 1024 && candidate <= 65535) currentPort = candidate;
+    } catch {
+      // First run: use the default port.
+    }
+  }
+  const server = app.listen(currentPort, HOST, () => {
+    console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
+  });
+  app.locals.server = server;
+
+  const handleSignal = () => {
+    const engine = app.locals.engine as ModelServerRuntime;
+    engine.shutdown();
+    server.close(() => process.exit(0));
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+}
+
+if (process.env.VLLM_NO_LISTEN !== '1') {
+  startServer().catch((err) => {
+    console.error('Failed to start vLLM Gateway Server:', err);
+    process.exit(1);
+  });
+}
