@@ -65,6 +65,7 @@ $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<
 хранятся отдельно в `%USERPROFILE%\.vllm-gateway` и не удаляются при деинсталляции.
 
 После установки запустите vLLM Gateway из меню «Пуск» или ярлыка на рабочем столе.
+При первом открытии веб-интерфейс предложит создать API-токен. Сохраните его: он показывается один раз. Для OpenAI-совместимого API передавайте `Authorization: Bearer <TOKEN>`. Для автоматизированного развёртывания можно заранее задать `VLLM_API_KEY`.
 Интерфейс и OpenAI-совместимый API доступны по адресу: **`http://localhost:3003`**. Порт по умолчанию — `3003`; изменить его можно в приложении: **Настройки → HTTP-порт**. Новый порт сохраняется между перезапусками.
 
 ---
@@ -105,6 +106,7 @@ git push origin v1.0.0
 | `PORT` | HTTP-порт сервера и OpenAI API | `3003` |
 | `VLLM_DATA_DIR` | Директория хранения `.gguf` моделей и бинарника `llama-server` | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Явный путь к исполняемому файлу `llama-server` | Автопоиск (`PATH`, `~/.vllm-gateway/bin`) |
+| `VLLM_API_KEY` | Необязательный постоянный API-токен; если не задан, токен создаётся при первом запуске в веб-интерфейсе | — |
 | `GEMINI_API_KEY` | Ключ Google Gemini API для облачных развёртываний (опционально) | — |
 | `HF_TOKEN` | Токен Hugging Face для приватных/закрытых GGUF-репозиториев | — |
 | `MODELSCOPE_TOKEN` | Токен ModelScope (опционально) | — |
@@ -115,6 +117,7 @@ git push origin v1.0.0
 
 ```bash
 curl http://localhost:3003/v1/chat/completions \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-3b-instruct-q4_k_m",
@@ -179,6 +182,8 @@ Or from a cloned repository:
 $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.ps1 | iex
 ```
 
+On first launch, the web UI asks you to initialize an API token. Save it immediately; it is shown only once. Send it as `Authorization: Bearer <TOKEN>` to the OpenAI-compatible API. For unattended deployments, set `VLLM_API_KEY` before starting the server.
+
 Start the gateway:
 
 ```bash
@@ -224,6 +229,7 @@ git push origin v1.0.0
 | `PORT` | HTTP server & OpenAI API port | `3003` |
 | `VLLM_DATA_DIR` | Storage path for `.gguf` weights and `llama-server` binaries | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Explicit path to `llama-server` binary | Auto-detected (`PATH`, `~/.vllm-gateway/bin`) |
+| `VLLM_API_KEY` | Optional fixed API token; if unset, create one during first-run setup in the web UI | — |
 | `GEMINI_API_KEY` | Optional Google Gemini API key for cloud deployments | — |
 | `HF_TOKEN` | Optional Hugging Face token for gated/private repos | — |
 | `MODELSCOPE_TOKEN` | Optional ModelScope token | — |
@@ -235,7 +241,7 @@ git push origin v1.0.0
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:3003/v1", api_key="not-needed")
+import os\n\nclient = OpenAI(base_url="http://localhost:3003/v1", api_key=os.environ["VLLM_API_KEY"])
 
 response = client.chat.completions.create(
     model="qwen2.5-3b-instruct-q4_k_m",
