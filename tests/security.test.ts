@@ -37,10 +37,16 @@ describe('SSRF and Path Traversal Security', () => {
       '192.168.1.42',
       '169.254.169.254',
       '100.64.0.10',
+      '192.0.2.1',
+      '198.18.0.1',
+      '198.51.100.2',
+      '203.0.113.4',
       '0.0.0.0',
       '::1',
       'fc00::1',
       'fe80::1',
+      '2001:db8::1',
+      '2002:7f00:1::1',
     ]) {
       assert.equal(isPrivateOrReservedIp(ip), true, `Expected ${ip} to be blocked`);
     }

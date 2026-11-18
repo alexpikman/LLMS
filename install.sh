@@ -174,4 +174,4 @@ if [[ ":$PATH:" != *":$BIN_LINK_DIR:"* ]]; then
 fi
 echo "Start the server with:"
 echo "  vllm-gateway"
-echo "Then open http://localhost:3000 in your browser (or set VLLM_API_KEY env var)."
+echo "Then open http://localhost:3003 in your browser (or set VLLM_API_KEY env var)."

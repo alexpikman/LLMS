@@ -8,7 +8,7 @@
 
 ## 🇷🇺 Русская версия
 
-**vLLM Gateway** — это полнофункциональный сервер инференса LLM и инженерная веб-студия с открытым OpenAI-совместимым API (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`), поддержкой локального запуска **GGUF-моделей на CPU и GPU**, загрузчиком весов из всех основных хабов и реальной визуализацией KV-кэша **PagedAttention**.
+**vLLM Gateway** — это полнофункциональный сервер инференса LLM и инженерная веб-студия с открытым OpenAI-совместимым API (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`), поддержкой локального запуска **GGUF-моделей на CPU и GPU**, загрузчиком весов из всех основных хабов и моделью распределения блоков KV-кэша на стороне шлюза и телеметрией реальных слотов `llama-server`.
 
 ### Основные возможности
 
@@ -30,7 +30,7 @@
      - **Только CPU (RAM)** — модель помещается в оперативную память.
      - **Недостаточно памяти / диска** — честное предупреждение до начала загрузки.
 4. **PagedAttention KV-кэш и GPU Context Controller**
-   - Динамическая сетка физических блоков (`P0..PN`), микро-слотов внутри каждого блока (`16` или `32`), расчёт внутренней хвостовой фрагментации, повторное использование префиксных блоков (`Prefix Caching`, `refCount`) и инспекция таблицы соответствия `Logical -> Physical Block Table`.
+   - Динамическая логическая модель блоков (`P0..PN`), микро-слотов внутри каждого блока (`16` или `32`), расчёт внутренней хвостовой фрагментации, повторное использование префиксных блоков (`Prefix Caching`, `refCount`) и инспекция таблицы соответствия `Logical -> Physical Block Table`.
    - Боковой виджет **GPU Context Controller** для изменения `kv_memory_utilization`, `total_blocks`, `block_size`, `max_num_seqs` и `max_model_len` на лету.
 5. **OpenAI-совместимый API и реальные бенчмарки (Recharts)**
    - Встроенные настройки HTTP-порта с сохранением значения между запусками и автоматическим переключением сервера.
@@ -65,6 +65,7 @@ $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<
 хранятся отдельно в `%USERPROFILE%\.vllm-gateway` и не удаляются при деинсталляции.
 
 После установки запустите vLLM Gateway из меню «Пуск» или ярлыка на рабочем столе.
+При первом открытии на localhost веб-интерфейс предложит создать API-токен. Сохраните его: он показывается один раз. Первичная настройка заблокирована для удалённых клиентов; на удалённом сервере задайте `VLLM_API_KEY` до запуска. Для OpenAI-совместимого API передавайте `Authorization: Bearer <TOKEN>`. Для автоматизированного развёртывания можно заранее задать `VLLM_API_KEY`.
 Интерфейс и OpenAI-совместимый API доступны по адресу: **`http://localhost:3003`**. Порт по умолчанию — `3003`; изменить его можно в приложении: **Настройки → HTTP-порт**. Новый порт сохраняется между перезапусками.
 
 ---
@@ -105,6 +106,7 @@ git push origin v1.0.0
 | `PORT` | HTTP-порт сервера и OpenAI API | `3003` |
 | `VLLM_DATA_DIR` | Директория хранения `.gguf` моделей и бинарника `llama-server` | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Явный путь к исполняемому файлу `llama-server` | Автопоиск (`PATH`, `~/.vllm-gateway/bin`) |
+| `VLLM_API_KEY` | Необязательный постоянный API-токен; если не задан, токен создаётся при первом запуске в веб-интерфейсе | — |
 | `GEMINI_API_KEY` | Ключ Google Gemini API для облачных развёртываний (опционально) | — |
 | `HF_TOKEN` | Токен Hugging Face для приватных/закрытых GGUF-репозиториев | — |
 | `MODELSCOPE_TOKEN` | Токен ModelScope (опционально) | — |
@@ -114,7 +116,9 @@ git push origin v1.0.0
 ### Пример использования OpenAI API
 
 ```bash
+export VLLM_API_KEY="<TOKEN>"
 curl http://localhost:3003/v1/chat/completions \
+  -H "Authorization: Bearer $VLLM_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "qwen2.5-3b-instruct-q4_k_m",
@@ -130,7 +134,7 @@ curl http://localhost:3003/v1/chat/completions \
 
 ## 🇬🇧 English Version
 
-**vLLM Gateway** is a production-ready LLM inference gateway and engineering studio providing an OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`), local **GGUF model execution on CPU & GPU**, a multi-source model downloader, real PC hardware compatibility scoring, and live **PagedAttention KV-cache** block visualization.
+**vLLM Gateway** is a production-ready LLM inference gateway and engineering studio providing an OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`), local **GGUF model execution on CPU & GPU**, a multi-source model downloader, real PC hardware compatibility scoring, and a gateway-side **PagedAttention KV-cache allocation model** with live `llama-server` slot telemetry.
 
 ### Key Features
 
@@ -151,7 +155,7 @@ curl http://localhost:3003/v1/chat/completions \
      - **CPU Only (RAM)** (`cpu_only`): fits within free system RAM.
      - **Insufficient Memory / Disk** (`insufficient`): honest pre-download warning.
 4. **Real-Time PagedAttention Grid & GPU Context Controller**
-   - Visualizes physical KV-cache blocks (`P0..PN`), token micro-slots (`16` or `32`), internal tail fragmentation, shared prefix blocks (`refCount`), and per-request `Logical -> Physical` block tables.
+   - Visualizes gateway-side logical KV-cache blocks (`P0..PN`), token micro-slots (`16` or `32`), internal tail fragmentation, shared prefix blocks (`refCount`), and per-request `Logical -> Physical` block tables.
    - Sidebar **GPU Context Controller** adjusts `kv_memory_utilization`, `total_blocks`, `block_size`, `max_num_seqs`, and `max_model_len` on the fly.
 5. **Server Settings, OpenAI API Console & Real Throughput Benchmarks (Recharts)**
    - Persistent HTTP port settings with live server rebinding.
@@ -178,6 +182,8 @@ Or from a cloned repository:
 ```powershell
 $env:VLLM_REPO="<OWNER>/<REPO>"; irm https://raw.githubusercontent.com/<OWNER>/<REPO>/main/install.ps1 | iex
 ```
+
+On first launch from localhost, the web UI asks you to initialize an API token. Save it immediately; it is shown only once. Remote first-run setup is blocked; set `VLLM_API_KEY` before starting a remote server. Send the token as `Authorization: Bearer <TOKEN>` to the OpenAI-compatible API. For unattended deployments, set `VLLM_API_KEY` before starting the server.
 
 Start the gateway:
 
@@ -208,6 +214,8 @@ NODE_ENV=production npm start
 bun run build:release
 ```
 
+To enable Windows Authenticode signing, add the GitHub Actions secrets `WINDOWS_CERTIFICATE_BASE64` (base64-encoded PFX) and `WINDOWS_CERTIFICATE_PASSWORD`. Without these secrets, the Windows build remains unsigned.
+
 To trigger automated multi-platform GitHub Release builds (`linux-x64`, `linux-arm64`, `macos-arm64`, `win-x64`), push a version tag:
 
 ```bash
@@ -224,6 +232,7 @@ git push origin v1.0.0
 | `PORT` | HTTP server & OpenAI API port | `3003` |
 | `VLLM_DATA_DIR` | Storage path for `.gguf` weights and `llama-server` binaries | `~/.vllm-gateway` |
 | `LLAMA_SERVER_PATH` | Explicit path to `llama-server` binary | Auto-detected (`PATH`, `~/.vllm-gateway/bin`) |
+| `VLLM_API_KEY` | Optional fixed API token; if unset, create one during first-run setup in the web UI | — |
 | `GEMINI_API_KEY` | Optional Google Gemini API key for cloud deployments | — |
 | `HF_TOKEN` | Optional Hugging Face token for gated/private repos | — |
 | `MODELSCOPE_TOKEN` | Optional ModelScope token | — |
@@ -233,9 +242,10 @@ git push origin v1.0.0
 ### OpenAI API Usage Example
 
 ```python
+import os
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:3003/v1", api_key="not-needed")
+client = OpenAI(base_url="http://localhost:3003/v1", api_key=os.environ["VLLM_API_KEY"])
 
 response = client.chat.completions.create(
     model="qwen2.5-3b-instruct-q4_k_m",

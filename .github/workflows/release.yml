@@ -2,6 +2,8 @@ name: Build & Publish Standalone Binaries
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   pull_request:
@@ -13,7 +15,32 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Type-check and test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Install locked dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Type-check
+        run: bun run lint
+
+      - name: Run tests
+        run: bun run test
+
   build-binaries:
+    needs: validate
     name: Build (${{ matrix.target }})
     strategy:
       fail-fast: false
@@ -52,6 +79,24 @@ jobs:
       - name: Build standalone binary and frontend dist
         run: bun run build:release
 
+      - name: Sign Windows executable
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD "release-build\vllm-gateway.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed" }
+          Remove-Item $certificatePath -Force
+
       - name: Smoke-test Windows executable
         if: matrix.target == 'win-x64'
         shell: pwsh
@@ -72,9 +117,11 @@ jobs:
             if (-not $ready) {
               throw "Standalone executable did not serve the UI on http://127.0.0.1:3003"
             }
-            Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/server/config" -Method Put -ContentType "application/json" -Body '{"port":3004}' | Out-Null
+            $auth = Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/auth/setup" -Method Post -ContentType "application/json" -Body '{}'
+            $headers = @{ Authorization = "Bearer $($auth.token)" }
+            Invoke-RestMethod -Uri "http://127.0.0.1:3003/api/server/config" -Method Put -Headers $headers -ContentType "application/json" -Body '{"port":3004}' | Out-Null
             Start-Sleep -Seconds 1
-            $config = Invoke-RestMethod -Uri "http://127.0.0.1:3004/api/server/config" -TimeoutSec 5
+            $config = Invoke-RestMethod -Uri "http://127.0.0.1:3004/api/server/config" -Headers $headers -TimeoutSec 5
             if ($config.port -ne 3004) {
               throw "Server did not apply the requested port 3004"
             }
@@ -121,6 +168,39 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "Inno Setup compilation failed with exit code $LASTEXITCODE"
           }
+
+      - name: Smoke-test Windows installer install and uninstall
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        run: |
+          $installDir = Join-Path $env:RUNNER_TEMP 'vllm-gateway-installer-test'
+          $installArgs = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', "/DIR=`"$installDir`"")
+          $install = Start-Process -FilePath ".\vllm-gateway-setup-win-x64.exe" -ArgumentList $installArgs -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "Windows installer exited with code $($install.ExitCode)" }
+          $installedExe = Join-Path $installDir 'vllm-gateway.exe'
+          if (-not (Test-Path $installedExe)) { throw "Installed executable not found: $installedExe" }
+          $uninstaller = Join-Path $installDir 'unins000.exe'
+          if (-not (Test-Path $uninstaller)) { throw "Uninstaller not found: $uninstaller" }
+          $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "Windows uninstaller exited with code $($uninstall.ExitCode)" }
+          if (Test-Path $installedExe) { throw "Uninstall left the gateway executable behind" }
+
+      - name: Sign Windows installer
+        if: matrix.target == 'win-x64'
+        shell: pwsh
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw "signtool.exe not found" }
+          & $signtool.FullName sign /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com /f $certificatePath /p $env:CERTIFICATE_PASSWORD "vllm-gateway-setup-win-x64.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Installer Authenticode signing failed" }
+          Remove-Item $certificatePath -Force
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4

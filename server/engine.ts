@@ -69,7 +69,7 @@ export class ModelServerRuntime {
   private reqCounter = 1;
   private depCounter = 4;
 
-  // Real PagedAttention Physical Block Allocator & Scheduler state
+  // Gateway-side logical PagedAttention allocation model & scheduler state
   private pagedBlockSize: 16 | 32 = 16;
   private pagedTotalBlocks = 64;
   private kvMemoryUtilization = 1.0;
@@ -237,12 +237,12 @@ export class ModelServerRuntime {
     this.broadcast();
   }
 
-  public shutdown(): void {
+  public async shutdown(): Promise<void> {
     if (this.slotPollTimer) {
       clearInterval(this.slotPollTimer);
       this.slotPollTimer = null;
     }
-    stopAllGgufProcesses();
+    await stopAllGgufProcesses();
   }
 
   private initPagedPool(): void {
@@ -925,7 +925,12 @@ export class ModelServerRuntime {
     return Math.min(dep.maxConcurrentRequests, this.maxNumSeqs);
   }
 
-  public async acquireSlot(deploymentId: string, record: RequestRecord): Promise<void> {
+  public async acquireSlot(
+    deploymentId: string,
+    record: RequestRecord,
+    signal?: AbortSignal
+  ): Promise<void> {
+    if (signal?.aborted) throw new Error('Запрос отменён клиентом.');
     const dep = this.deployments.get(deploymentId);
     if (!dep) throw new Error('Модель не найдена');
 
@@ -948,9 +953,26 @@ export class ModelServerRuntime {
     );
     this.broadcast();
 
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
       const queue = this.waitQueues.get(deploymentId) ?? [];
-      queue.push({ resolve });
+      const waiter: QueuedWaiter = {
+        resolve: () => {
+          signal?.removeEventListener('abort', onAbort);
+          resolve();
+        },
+      };
+      const onAbort = () => {
+        const index = queue.indexOf(waiter);
+        if (index >= 0) {
+          queue.splice(index, 1);
+          dep.queuedRequests = Math.max(0, dep.queuedRequests - 1);
+          if (queue.length === 0) this.waitQueues.delete(deploymentId);
+          this.broadcast();
+          reject(new Error('Запрос отменён клиентом.'));
+        }
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      queue.push(waiter);
       this.waitQueues.set(deploymentId, queue);
     });
 

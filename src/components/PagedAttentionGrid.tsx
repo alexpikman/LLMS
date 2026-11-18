@@ -106,7 +106,7 @@ export const PagedAttentionGrid: React.FC<PagedAttentionGridProps> = ({
       {/* Header & Geometry Controls */}
       <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-lg font-semibold text-slate-900" style={{ textWrap: 'balance' }}>
+          <h1 className="text-lg font-semibold text-slate-900 text-balance">
             Динамическая сетка блоков PagedAttention и слотов KV-кэша
           </h1>
           <p className="text-xs text-slate-600 mt-0.5">

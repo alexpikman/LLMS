@@ -30,7 +30,7 @@ async function bootTestServer() {
   const baseUrl = `http://127.0.0.1:${port}`;
 
   cleanupFns.push(async () => {
-    engine.shutdown();
+    await engine.shutdown();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     delete process.env.VLLM_DATA_DIR;
     fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -69,6 +69,8 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
 
     const unauthState = await fetch(`${baseUrl}/api/engine/state`);
     assert.equal(unauthState.status, 401);
+    const unauthConfig = await fetch(`${baseUrl}/api/server/config`);
+    assert.equal(unauthConfig.status, 401);
   });
 
   it('completes setup once, authenticates via Bearer token & session cookie, and validates OpenAI payloads', async () => {
@@ -120,6 +122,23 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
       headers: { Cookie: cookie },
     });
     assert.equal(cookieModels.status, 200);
+
+    const csrfBlocked = await fetch(`${baseUrl}/api/engine/cache/clear`, {
+      method: 'POST',
+      headers: { Cookie: cookie },
+    });
+    assert.equal(csrfBlocked.status, 403);
+
+    const csrfAllowed = await fetch(`${baseUrl}/api/engine/cache/clear`, {
+      method: 'POST',
+      headers: { Cookie: cookie, Origin: baseUrl },
+    });
+    assert.equal(csrfAllowed.status, 200);
+
+    const protectedConfig = await fetch(`${baseUrl}/api/server/config`, {
+      headers: { Authorization: `Bearer ${setupJson.token}` },
+    });
+    assert.equal(protectedConfig.status, 200);
 
     // OpenAI parameter validation (400 / 404)
     const emptyMsgs = await fetch(`${baseUrl}/v1/chat/completions`, {
@@ -182,6 +201,22 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     assert.equal(diagText.includes(setupJson.token), false);
     assert.equal(diagText.includes('tokenHash'), false);
     assert.equal(diagText.includes('sessionSecret'), false);
+
+    const rotateRes = await fetch(`${baseUrl}/api/auth/rotate`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${setupJson.token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(rotateRes.status, 200);
+    const rotated = (await rotateRes.json()) as { token: string };
+    assert.ok(rotated.token.startsWith('sk-vllm-'));
+    const oldTokenRes = await fetch(`${baseUrl}/v1/models`, {
+      headers: { Authorization: `Bearer ${setupJson.token}` },
+    });
+    assert.equal(oldTokenRes.status, 401);
   });
 
   it('enforces ModelServerRuntime scheduler queue, SHA-256 RAM cache, and PagedAttention slot lifecycle', async () => {
@@ -227,6 +262,26 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     engine.releaseSlot(dep.id);
     await secondPromise;
     assert.equal(secondAcquired, true);
+    engine.releaseSlot(dep.id);
+
+    const blockerRecord = engine.createRequestRecord({
+      deployment: dep,
+      endpoint: '/v1/chat/completions',
+      stream: false,
+      promptPreview: 'Queue blocker',
+    });
+    await engine.acquireSlot(dep.id, blockerRecord);
+    const cancelledRecord = engine.createRequestRecord({
+      deployment: dep,
+      endpoint: '/v1/chat/completions',
+      stream: true,
+      promptPreview: 'Cancelled prompt',
+    });
+    const abortController = new AbortController();
+    const cancelledWait = engine.acquireSlot(dep.id, cancelledRecord, abortController.signal);
+    abortController.abort();
+    await assert.rejects(cancelledWait, /отменён клиентом/);
+    assert.equal(engine.getSnapshot().queuedRequestsCount, 0);
     engine.releaseSlot(dep.id);
 
     // Verify RAM response cache

@@ -11,7 +11,8 @@ import {
   probeDirectGgufUrl,
   searchHubModels,
 } from './server/downloader.ts';
-import { modelServer } from './server/engine.ts';
+import { modelServer as defaultModelServer, type ModelServerRuntime } from './server/engine.ts';
+import { AuthManager, createAuthMiddleware, createRateLimiter } from './server/security.ts';
 import {
   formatGeminiError,
   generateGeminiEmbeddings,
@@ -46,9 +47,16 @@ function resolvePublicDistDir(): string {
   return path.resolve(process.cwd(), 'dist');
 }
 
-async function startServer() {
+export async function createGatewayApp(options: {
+  engine?: ModelServerRuntime;
+  authManager?: AuthManager;
+  enableVite?: boolean;
+} = {}) {
   const app = express();
   app.use(express.json({ limit: '4mb' }));
+  const modelServer = options.engine ?? defaultModelServer;
+  const authManager = options.authManager ?? new AuthManager();
+  app.locals.engine = modelServer;
 
   const HOST = process.env.HOST || '127.0.0.1';
   let currentPort = Number(process.env.PORT) || DEFAULT_PORT;
@@ -63,7 +71,91 @@ async function startServer() {
       // First run: use the default port.
     }
   }
-  let server: ReturnType<typeof app.listen>;
+  app.get('/health', (_req, res) => {
+    res.json({ status: 'ok', version: '0.1.0' });
+  });
+
+  app.get('/ready', (_req, res) => {
+    try {
+      const dataDir = process.env.VLLM_DATA_DIR?.trim() || PORT_CONFIG_DIR;
+      fs.accessSync(dataDir, fs.constants.W_OK);
+      res.json({ ready: true, dataDirWritable: true });
+    } catch {
+      res.status(503).json({ ready: false, dataDirWritable: false });
+    }
+  });
+
+  const authRateLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 10 });
+
+  app.get('/api/auth/status', (req, res) => {
+    res.json(authManager.getAuthStatus(req));
+  });
+
+  app.post('/api/auth/setup', authRateLimiter, (req, res) => {
+    const remoteAddress = req.socket.remoteAddress?.replace(/^::ffff:/i, '');
+    const requestHost = req.hostname.toLowerCase();
+    const localBind = HOST === '127.0.0.1' || HOST === '::1' || HOST === 'localhost';
+    const localHost = requestHost === 'localhost' || requestHost === '127.0.0.1' || requestHost === '::1';
+    if (
+      authManager.isSetupRequired() &&
+      (!localBind || !localHost || (remoteAddress !== '127.0.0.1' && remoteAddress !== '::1'))
+    ) {
+      res.status(403).json({ error: 'Первичную настройку токена разрешено выполнять только с localhost. Для удалённого сервера задайте VLLM_API_KEY.' });
+      return;
+    }
+    try {
+      const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
+      const result = authManager.setupInitialToken(requestedToken);
+      authManager.setSessionCookieHeader(
+        res,
+        req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+      );
+      res.status(201).json(result);
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
+
+  app.post('/api/auth/login', authRateLimiter, (req, res) => {
+    const token = typeof req.body?.token === 'string' ? req.body.token : '';
+    if (!authManager.verifyToken(token)) {
+      res.status(401).json({ error: 'Неверный API-токен.' });
+      return;
+    }
+    authManager.setSessionCookieHeader(
+      res,
+      req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+    );
+    res.json({ authenticated: true });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    authManager.clearSessionCookieHeader(
+      res,
+      req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+    );
+    res.status(204).end();
+  });
+
+  app.use(
+    ['/api', '/v1'],
+    createRateLimiter({ windowMs: 60_000, maxRequests: 180 }),
+    createAuthMiddleware(authManager)
+  );
+
+  app.post('/api/auth/rotate', (req, res) => {
+    try {
+      const requestedToken = typeof req.body?.token === 'string' ? req.body.token : undefined;
+      const result = authManager.rotateToken(requestedToken);
+      authManager.setSessionCookieHeader(
+        res,
+        req.secure || String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim() === 'https'
+      );
+      res.json(result);
+    } catch (err) {
+      res.status(409).json({ error: err instanceof Error ? err.message : String(err) });
+    }
+  });
 
   app.get('/api/server/config', (_req, res) => {
     res.json({ host: HOST, port: currentPort, defaultPort: DEFAULT_PORT });
@@ -100,11 +192,11 @@ async function startServer() {
         return;
       }
 
-      const previousServer = server;
-      server = nextServer;
+      const previousServer = app.locals.server as ReturnType<typeof app.listen> | undefined;
+      app.locals.server = nextServer;
       currentPort = nextPort;
       res.json({ port: currentPort, unchanged: false });
-      res.once('finish', () => previousServer.close());
+      res.once('finish', () => previousServer?.close());
     });
   });
 
@@ -128,6 +220,22 @@ async function startServer() {
 
   app.post('/v1/chat/completions', async (req, res) => {
     const body = req.body ?? {};
+    if (body.temperature !== undefined && (typeof body.temperature !== 'number' || body.temperature < 0 || body.temperature > 2)) {
+      res.status(400).json({ error: { message: 'temperature должен быть числом от 0 до 2.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.top_p !== undefined && (typeof body.top_p !== 'number' || body.top_p < 0 || body.top_p > 1)) {
+      res.status(400).json({ error: { message: 'top_p должен быть числом больше 0 и не больше 1.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.n !== undefined && body.n !== 1) {
+      res.status(400).json({ error: { message: 'Поддерживается только n=1.', type: 'invalid_request_error' } });
+      return;
+    }
+    if (body.max_tokens !== undefined && (!Number.isInteger(body.max_tokens) || body.max_tokens < 1)) {
+      res.status(400).json({ error: { message: 'max_tokens должен быть положительным целым числом.', type: 'invalid_request_error' } });
+      return;
+    }
     const messages = Array.isArray(body.messages) ? (body.messages as OpenAiChatMessage[]) : [];
     if (messages.length === 0) {
       res.status(400).json({
@@ -163,6 +271,11 @@ async function startServer() {
     }
 
     const stream = Boolean(body.stream);
+    const streamAbortController = stream ? new AbortController() : null;
+    const abortOnDisconnect = () => {
+      if (streamAbortController && !res.writableEnded) streamAbortController.abort();
+    };
+    if (stream) res.once('close', abortOnDisconnect);
     const lastUserMessage =
       [...messages].reverse().find((m) => m.role === 'user')?.content ??
       messages[messages.length - 1]?.content ??
@@ -192,7 +305,21 @@ async function startServer() {
     const cacheKey = modelServer.computeCacheKey(deployment, { endpoint: 'chat', messages });
     const textModel = deployment.baseModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
-    await modelServer.acquireSlot(deployment.id, record);
+    try {
+      await modelServer.acquireSlot(deployment.id, record, streamAbortController?.signal);
+    } catch (err) {
+      if (streamAbortController?.signal.aborted) {
+        res.off('close', abortOnDisconnect);
+        modelServer.markRequestError(
+          deployment.id,
+          record,
+          'Клиент прервал запрос до получения слота инференса.',
+          performance.now() - startedAt
+        );
+        return;
+      }
+      throw err;
+    }
 
     try {
       const cached = modelServer.lookupCache(deployment, cacheKey);
@@ -292,15 +419,18 @@ async function startServer() {
                 defaultSystemInstruction: deployment.systemInstruction,
                 temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
                 maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+                signal: streamAbortController?.signal,
               })
             : streamGeminiText({
                 baseModel: textModel,
                 messages,
                 defaultSystemInstruction: deployment.systemInstruction,
                 thinkingLevel: deployment.thinkingLevel,
+                signal: streamAbortController?.signal,
               });
 
         for await (const chunk of tokenStream) {
+          if (streamAbortController?.signal.aborted) break;
           if (chunk.text) {
             if (ttftMs === null) {
               ttftMs = performance.now() - startedAt;
@@ -322,6 +452,11 @@ async function startServer() {
             completionTokens = chunk.usage.completionTokens || completionTokens;
             totalTokens = chunk.usage.totalTokens || totalTokens;
           }
+        }
+
+        if (streamAbortController?.signal.aborted) {
+          modelServer.markRequestError(deployment.id, record, 'Клиент прервал потоковый запрос.', performance.now() - startedAt);
+          return;
         }
 
         const totalDurationMs = performance.now() - startedAt;
@@ -380,6 +515,7 @@ async function startServer() {
                 messages,
                 defaultSystemInstruction: deployment.systemInstruction,
                 thinkingLevel: deployment.thinkingLevel,
+                signal: streamAbortController?.signal,
               });
         const totalDurationMs = performance.now() - startedAt;
         const promptTokens = result.usage.promptTokens;
@@ -427,7 +563,7 @@ async function startServer() {
         mapped.message,
         performance.now() - startedAt
       );
-      if (stream && res.headersSent) {
+      if (stream && res.headersSent && !res.destroyed) {
         res.write(
           `data: ${JSON.stringify({ error: { message: mapped.message, code: mapped.status } })}\n\n`
         );
@@ -439,6 +575,7 @@ async function startServer() {
         });
       }
     } finally {
+      if (stream) res.off('close', abortOnDisconnect);
       modelServer.releaseSlot(deployment.id);
     }
   });
@@ -474,6 +611,11 @@ async function startServer() {
     }
 
     const stream = Boolean(body.stream);
+    const streamAbortController = stream ? new AbortController() : null;
+    const abortOnDisconnect = () => {
+      if (streamAbortController && !res.writableEnded) streamAbortController.abort();
+    };
+    if (stream) res.once('close', abortOnDisconnect);
     const record = modelServer.createRequestRecord({
       deployment,
       endpoint: '/v1/completions',
@@ -489,7 +631,21 @@ async function startServer() {
     const cacheKey = modelServer.computeCacheKey(deployment, { endpoint: 'completions', prompt });
     const textModel = deployment.baseModel as 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
-    await modelServer.acquireSlot(deployment.id, record);
+    try {
+      await modelServer.acquireSlot(deployment.id, record, streamAbortController?.signal);
+    } catch (err) {
+      if (streamAbortController?.signal.aborted) {
+        res.off('close', abortOnDisconnect);
+        modelServer.markRequestError(
+          deployment.id,
+          record,
+          'Клиент прервал запрос до получения слота инференса.',
+          performance.now() - startedAt
+        );
+        return;
+      }
+      throw err;
+    }
 
     try {
       const cached = modelServer.lookupCache(deployment, cacheKey);
@@ -557,6 +713,7 @@ async function startServer() {
                 defaultSystemInstruction: deployment.systemInstruction,
                 temperature: typeof body.temperature === 'number' ? body.temperature : undefined,
                 maxTokens: typeof body.max_tokens === 'number' ? body.max_tokens : undefined,
+                signal: streamAbortController?.signal,
               })
             : streamGeminiText({
                 baseModel: textModel,
@@ -566,6 +723,7 @@ async function startServer() {
               });
 
         for await (const chunk of compStream) {
+          if (streamAbortController?.signal.aborted) break;
           if (chunk.text) {
             if (ttftMs === null) ttftMs = performance.now() - startedAt;
             fullText += chunk.text;
@@ -585,6 +743,11 @@ async function startServer() {
             completionTokens = chunk.usage.completionTokens || completionTokens;
             totalTokens = chunk.usage.totalTokens || totalTokens;
           }
+        }
+
+        if (streamAbortController?.signal.aborted) {
+          modelServer.markRequestError(deployment.id, record, 'Клиент прервал потоковый запрос.', performance.now() - startedAt);
+          return;
         }
 
         const totalDurationMs = performance.now() - startedAt;
@@ -692,12 +855,17 @@ async function startServer() {
         res.status(mapped.status).json({ error: { message: mapped.message, type: 'api_error' } });
       }
     } finally {
+      if (stream) res.off('close', abortOnDisconnect);
       modelServer.releaseSlot(deployment.id);
     }
   });
 
   app.post('/v1/embeddings', async (req, res) => {
     const body = req.body ?? {};
+    if (body.encoding_format !== undefined && !['float', 'base64'].includes(body.encoding_format)) {
+      res.status(400).json({ error: { message: 'encoding_format должен быть float или base64.', type: 'invalid_request_error' } });
+      return;
+    }
     const rawInput = body.input;
     const inputs = Array.isArray(rawInput)
       ? rawInput.map(String)
@@ -737,6 +905,7 @@ async function startServer() {
 
     try {
       const { embeddings, totalTokens } = await generateGeminiEmbeddings(inputs);
+      const useBase64 = body.encoding_format === 'base64';
       const durationMs = performance.now() - startedAt;
       modelServer.markRequestCompleted(deployment.id, record, {
         cacheHit: false,
@@ -752,7 +921,9 @@ async function startServer() {
         data: embeddings.map((vec, index) => ({
           object: 'embedding',
           index,
-          embedding: vec,
+          embedding: useBase64
+            ? Buffer.from(new Float32Array(vec).buffer).toString('base64')
+            : vec,
         })),
         model: deployment.alias,
         usage: {
@@ -777,6 +948,17 @@ async function startServer() {
   // =========================================================================
   // Model Lifecycle & Real Telemetry Endpoints (/api/*)
   // =========================================================================
+  app.get('/api/diagnostics', (_req, res) => {
+    res.json({
+      version: '0.1.0',
+      nodeVersion: process.version,
+      platform: process.platform,
+      architecture: process.arch,
+      uptimeSeconds: Math.floor(process.uptime()),
+      snapshot: modelServer.getSnapshot(),
+    });
+  });
+
   app.get('/api/engine/state', (_req, res) => {
     res.json(modelServer.getSnapshot());
   });
@@ -1006,34 +1188,61 @@ async function startServer() {
   // =========================================================================
   // Vite Middleware (Dev) or Static Dist (Prod / Standalone Binary)
   // =========================================================================
-  if (process.env.NODE_ENV === 'production') {
-    const distDir = resolvePublicDistDir();
-    app.use(express.static(distDir));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distDir, 'index.html'));
-    });
-  } else {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+  if (options.enableVite !== false) {
+    if (process.env.NODE_ENV === 'production') {
+      const distDir = resolvePublicDistDir();
+      app.use(express.static(distDir));
+      app.get('*', (_req, res) => {
+        res.sendFile(path.join(distDir, 'index.html'));
+      });
+    } else {
+      const { createServer: createViteServer } = await import('vite');
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+    }
   }
 
-  server = app.listen(currentPort, HOST, () => {
-    console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
-  });
-
-  const handleSignal = () => {
-    modelServer.shutdown();
-    server.close(() => process.exit(0));
-  };
-  process.on('SIGINT', handleSignal);
-  process.on('SIGTERM', handleSignal);
+  return app;
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start vLLM Gateway Server:', err);
-  process.exit(1);
-});
+async function startServer() {
+  const app = await createGatewayApp();
+  const HOST = process.env.HOST || '127.0.0.1';
+  const savedPort = Number(process.env.PORT) || DEFAULT_PORT;
+  let currentPort = savedPort;
+  if (!process.env.PORT) {
+    try {
+      const savedConfig = JSON.parse(fs.readFileSync(PORT_CONFIG_PATH, 'utf8')) as { port?: number };
+      const candidate = Number(savedConfig.port);
+      if (Number.isInteger(candidate) && candidate >= 1024 && candidate <= 65535) currentPort = candidate;
+    } catch {
+      // First run: use the default port.
+    }
+  }
+  const server = app.listen(currentPort, HOST, () => {
+    console.log(`vLLM Gateway Server listening on http://${HOST}:${currentPort}`);
+  });
+  app.locals.server = server;
+
+  const handleSignal = () => {
+    const engine = app.locals.engine as ModelServerRuntime;
+    const activeServer = app.locals.server as ReturnType<typeof app.listen>;
+    activeServer.close();
+    activeServer.closeAllConnections?.();
+    void engine.shutdown()
+      .catch((err) => console.error('Failed to stop inference processes:', err))
+      .finally(() => process.exit(0));
+  };
+  process.once('SIGINT', handleSignal);
+  process.once('SIGTERM', handleSignal);
+}
+
+if (process.env.VLLM_NO_LISTEN !== '1') {
+  startServer().catch((err) => {
+    console.error('Failed to start vLLM Gateway Server:', err);
+    process.exit(1);
+  });
+}

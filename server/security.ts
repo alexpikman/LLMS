@@ -1,6 +1,8 @@
 import crypto from 'node:crypto';
 import dns from 'node:dns/promises';
 import net from 'node:net';
+import https from 'node:https';
+import { Readable } from 'node:stream';
 import path from 'node:path';
 import type { NextFunction, Request, Response } from 'express';
 import {
@@ -39,6 +41,12 @@ export function isPrivateOrReservedIp(rawIp: string): boolean {
     if (a === 169 && b === 254) return true; // 169.254.0.0/16 link-local & cloud metadata
     if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12
     if (a === 192 && b === 168) return true; // 192.168.0.0/16
+    if (a === 192 && b === 0 && octets[2] === 0) return true; // 192.0.0.0/24 protocol assignments
+    if (a === 192 && b === 0 && octets[2] === 2) return true; // 192.0.2.0/24 documentation
+    if (a === 192 && b === 88 && octets[2] === 99) return true; // 192.88.99.0/24 deprecated 6to4 relay
+    if (a === 198 && (b === 18 || b === 19)) return true; // 198.18.0.0/15 benchmarking
+    if (a === 198 && b === 51 && octets[2] === 100) return true; // 198.51.100.0/24 documentation
+    if (a === 203 && b === 0 && octets[2] === 113) return true; // 203.0.113.0/24 documentation
     if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 CGNAT
     if (a >= 224) return true; // multicast / reserved
     return false;
@@ -50,6 +58,9 @@ export function isPrivateOrReservedIp(rawIp: string): boolean {
   if (lower.startsWith('fe80:')) return true; // link-local
   if (lower.startsWith('fc') || lower.startsWith('fd')) return true; // ULA fc00::/7
   if (lower.startsWith('ff')) return true; // multicast
+  if (lower.startsWith('2001:db8:') || lower.startsWith('2001:0:') || lower.startsWith('2002:')) return true;
+  const firstHextet = Number.parseInt(lower.split(':')[0] || '0', 16);
+  if ((firstHextet & 0xe000) !== 0x2000) return true; // Only global unicast 2000::/3 is routable
   return false;
 }
 
@@ -112,44 +123,74 @@ export async function safeFetch(
 
   for (let hop = 0; hop <= maxRedirects; hop++) {
     const safeUrl = await assertSafeRemoteUrl(currentUrl);
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-    let externalSignal = init.signal;
-    const onAbort = () => controller.abort();
-    if (externalSignal) {
-      if (externalSignal.aborted) controller.abort();
-      else externalSignal.addEventListener('abort', onAbort, { once: true });
+    const host = safeUrl.hostname.replace(/^\\[|\\]$/g, '');
+    const resolved = await dns.lookup(host, { all: true, verbatim: true });
+    if (!resolved.length || resolved.some((record) => isPrivateOrReservedIp(record.address))) {
+      throw new Error(`DNS-адрес хоста ${host} не прошёл SSRF-проверку.`);
     }
 
-    try {
-      const res = await fetch(safeUrl.toString(), {
-        ...init,
-        redirect: 'manual',
-        signal: controller.signal,
+    // Pin the socket to the exact public IP that was validated above. The TLS
+    // server name remains the original hostname, preventing DNS rebinding
+    // between validation and the actual TCP connection.
+    const pinned = resolved[0];
+    const headers = new Headers(init.headers);
+    const requestHeaders: Record<string, string> = {};
+    headers.forEach((value, key) => { requestHeaders[key] = value; });
+
+    const response = await new Promise<globalThis.Response>((resolve, reject) => {
+      const request = https.request({
+        protocol: 'https:',
+        hostname: host,
+        port: safeUrl.port ? Number(safeUrl.port) : 443,
+        path: `${safeUrl.pathname}${safeUrl.search}`,
+        method: init.method ?? 'GET',
+        headers: requestHeaders,
+        servername: net.isIP(host) ? undefined : host,
+        signal: init.signal ?? undefined,
+        lookup: ((_hostname: string, _options: unknown, callback: (error: NodeJS.ErrnoException | null, address: string, family: number) => void) => {
+          callback(null, pinned.address, pinned.family);
+        }) as never,
+      }, (incoming) => {
+        const responseHeaders = new Headers();
+        for (const [key, value] of Object.entries(incoming.headers)) {
+          if (Array.isArray(value)) value.forEach((item) => responseHeaders.append(key, item));
+          else if (typeof value === 'string') responseHeaders.set(key, value);
+        }
+        const status = incoming.statusCode ?? 502;
+        const body = init.method?.toUpperCase() === 'HEAD' || status === 204 || status === 304
+          ? null
+          : Readable.toWeb(incoming) as ReadableStream<Uint8Array>;
+        resolve(new Response(body, {
+          status,
+          statusText: incoming.statusMessage,
+          headers: responseHeaders,
+        }));
       });
 
-      if (res.status >= 300 && res.status < 400) {
-        const location = res.headers.get('location');
-        try {
-          await res.body?.cancel();
-        } catch {
-          // Ignore body cancel errors
-        }
-        if (!location) {
-          throw new Error(`Сервер вернул редирект ${res.status} без заголовка Location.`);
-        }
-        currentUrl = new URL(location, safeUrl).toString();
-        continue;
-      }
+      request.setTimeout(timeoutMs, () => request.destroy(new Error('Истекло время ожидания удалённого сервера.')));
+      request.once('error', reject);
 
-      return res;
-    } finally {
-      clearTimeout(timer);
-      if (externalSignal) {
-        externalSignal.removeEventListener('abort', onAbort);
+      const body = init.body;
+      if (typeof body === 'string' || body instanceof Uint8Array) {
+        request.write(body);
+      } else if (body !== null && body !== undefined) {
+        request.destroy(new Error('safeFetch поддерживает только строковое или бинарное тело запроса.'));
+        return;
       }
+      request.end();
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      await response.body?.cancel();
+      if (!location) {
+        throw new Error(`Сервер вернул редирект ${response.status} без заголовка Location.`);
+      }
+      currentUrl = new URL(location, safeUrl).toString();
+      continue;
     }
+
+    return response;
   }
 
   throw new Error('Превышено максимальное число перенаправлений URL (SSRF-защита).');
@@ -189,7 +230,11 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
     if (idx <= 0) continue;
     const key = part.slice(0, idx).trim();
     const val = part.slice(idx + 1).trim();
-    map[key] = decodeURIComponent(val);
+    try {
+      map[key] = decodeURIComponent(val);
+    } catch {
+      // Ignore malformed cookie values instead of failing the whole request.
+    }
   }
   return map;
 }
@@ -331,18 +376,18 @@ export class AuthManager {
     return this.verifySessionCookie(req.headers.cookie);
   }
 
-  public setSessionCookieHeader(res: Response): void {
+  public setSessionCookieHeader(res: Response, secure = false): void {
     const value = encodeURIComponent(this.signSessionCookie());
     res.setHeader(
       'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400`
+      `${SESSION_COOKIE_NAME}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400${secure ? '; Secure' : ''}`
     );
   }
 
-  public clearSessionCookieHeader(res: Response): void {
+  public clearSessionCookieHeader(res: Response, secure = false): void {
     res.setHeader(
       'Set-Cookie',
-      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0`
+      `${SESSION_COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure ? '; Secure' : ''}`
     );
   }
 
@@ -382,7 +427,34 @@ export function openAiError(
 
 export function createAuthMiddleware(authManager: AuthManager) {
   return (req: Request, res: Response, next: NextFunction): void => {
-    if (authManager.isRequestAuthenticated(req)) {
+    const bearer = authManager.extractBearerOrApiKey(req);
+    const bearerAuthenticated = Boolean(bearer && authManager.verifyToken(bearer));
+    const cookieAuthenticated = !bearerAuthenticated && authManager.verifySessionCookie(req.headers.cookie);
+
+    if (bearerAuthenticated || cookieAuthenticated) {
+      if (
+        cookieAuthenticated &&
+        !['GET', 'HEAD', 'OPTIONS'].includes(req.method.toUpperCase())
+      ) {
+        const origin = req.headers.origin;
+        const host = req.headers.host;
+        if (!origin || !host) {
+          res.status(403).json(openAiError('Для cookie-сессии требуется same-origin запрос.', 'forbidden', null, 'csrf_check_failed'));
+          return;
+        }
+        try {
+          const originUrl = new URL(origin);
+          const forwardedProto = String(req.headers['x-forwarded-proto'] ?? '').split(',')[0].trim();
+          const expectedProtocol = req.secure || forwardedProto === 'https' ? 'https:' : 'http:';
+          if (originUrl.host !== host || originUrl.protocol !== expectedProtocol) {
+            res.status(403).json(openAiError('Cross-origin запросы с cookie-сессией запрещены.', 'forbidden', null, 'csrf_check_failed'));
+            return;
+          }
+        } catch {
+          res.status(403).json(openAiError('Некорректный заголовок Origin.', 'forbidden', null, 'csrf_check_failed'));
+          return;
+        }
+      }
       next();
       return;
     }
