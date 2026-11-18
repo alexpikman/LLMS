@@ -28,6 +28,25 @@ New-Item -ItemType Directory -Force -Path (Join-Path $DataDir "bin") | Out-Null
 $Installed = $false
 
 if ($Repo) {
+  $InstallerName = "vllm-gateway-setup-win-x64.exe"
+  $InstallerUrl = "https://github.com/$Repo/releases/latest/download/$InstallerName"
+  $TmpInstaller = Join-Path $env:TEMP $InstallerName
+  Write-Host "==> Downloading Windows installer from $InstallerUrl ..."
+  try {
+    Invoke-WebRequest -Uri $InstallerUrl -OutFile $TmpInstaller -UseBasicParsing
+    $process = Start-Process -FilePath $TmpInstaller -ArgumentList @("/DIR=`"$InstallDir`"", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART") -Wait -PassThru
+    if ($process.ExitCode -ne 0) {
+      throw "Windows installer exited with code $($process.ExitCode)"
+    }
+    Remove-Item $TmpInstaller -Force
+    $Installed = $true
+  } catch {
+    Write-Warning "Prebuilt Windows installer not available; trying portable ZIP."
+    if (Test-Path $TmpInstaller) { Remove-Item $TmpInstaller -Force }
+  }
+}
+
+if (-not $Installed -and $Repo) {
   $DownloadUrl = "https://github.com/$Repo/releases/latest/download/$AssetName"
   $TmpZip = Join-Path $env:TEMP $AssetName
   Write-Host "==> Downloading vLLM Gateway from $DownloadUrl ..."
