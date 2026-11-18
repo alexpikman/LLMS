@@ -264,6 +264,18 @@ describe('Gateway HTTP API Security & OpenAI Compliance', () => {
     assert.equal(secondAcquired, true);
     engine.releaseSlot(dep.id);
 
+    const cancelledRecord = engine.createRequestRecord({
+      deployment: dep,
+      endpoint: '/v1/chat/completions',
+      stream: true,
+      promptPreview: 'Cancelled prompt',
+    });
+    const abortController = new AbortController();
+    const cancelledWait = engine.acquireSlot(dep.id, cancelledRecord, abortController.signal);
+    abortController.abort();
+    await assert.rejects(cancelledWait, /отменён клиентом/);
+    assert.equal(engine.getSnapshot().queuedRequestsCount, 0);
+
     // Verify RAM response cache
     const key = engine.computeCacheKey(dep, { messages: [{ role: 'user', content: 'ping' }] });
     engine.storeCache(dep, key, {
