@@ -2,11 +2,10 @@ name: Build & Publish Standalone Binaries
 
 on:
   push:
-    tags:
-      - 'v*'
-  push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - main
@@ -88,6 +87,7 @@ jobs:
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
           $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
           [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
@@ -168,12 +168,13 @@ jobs:
           }
 
       - name: Sign Windows installer
-        if: matrix.target == 'win-x64' && secrets.WINDOWS_CERTIFICATE_BASE64 != ''
+        if: matrix.target == 'win-x64'
         shell: pwsh
         env:
           CERTIFICATE_BASE64: ${{ secrets.WINDOWS_CERTIFICATE_BASE64 }}
           CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
+          if ([string]::IsNullOrWhiteSpace($env:CERTIFICATE_BASE64)) { Write-Host 'Signing certificate is not configured; skipping Authenticode signing.'; exit 0 }
           $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.pfx'
           [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:CERTIFICATE_BASE64))
           $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" |
